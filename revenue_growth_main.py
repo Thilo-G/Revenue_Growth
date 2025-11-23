@@ -27,35 +27,7 @@ try:
     print("Shape:", df_industry.shape)
 
 except Exception as e:
-    #Exception is the base class for all exceptions (FilenotFoundError, ValueError, etc.)
-    #As e saves the "exception"
-    print(f"Fehler beim Einlesen der Dateien: {e}")
-
-# Normalize strings to ensure case-insensitive and whitespace-consistent comparison
-def normalize_strings(strings):
-    return set(s.upper().strip() for s in strings)
-normalized_firm_names_revenue = normalize_strings(set(df_revenue.iloc[0].dropna().astype(str).str.strip()));
-
-# Print the number of unique firms in each dataset
-print(f"Number of Unique Firms in Revenue File: {len(normalized_firm_names_revenue)}")
-
-
-# Use the first row as header for industry dataframe
-df_industry.columns = df_industry.iloc[0]
-df_industry = df_industry.iloc[1:].copy()
-
-# Firms before filter
-n_firms_industry_before = df_industry["ID"].nunique()
-print("Number of Firms in Industry (before filter):", n_firms_industry_before)
-
-# Keep only firms where gics_sub_industry_name is NOT NA
-df_industry = df_industry[df_industry["gics_sub_industry_name"].notna()].copy()
-
-n_industries_before = df_industry['gics_industry_name'].nunique(dropna=True)
-print("Number of Industries:", n_industries_before)
-
-# After removing rows with missing sub-industry, exclude sub-industries with fewer than 3 firms
-if 'gics_sub_industry_name' not in df_industry.columns:
+    print(f'Could not run firm-level logistic regression: {e}')
     raise KeyError("Expected column 'gics_sub_industry_name' in df_industry")
 
 # raw counts per sub-industry (before threshold)
@@ -186,10 +158,10 @@ for col in original_cols:
         # compute derived series (vectorized)
         new_cols_data[total_revenue_col] = total
         #new_cols_data[share_ret_revenue_col] = ret_s / total_nonzero
-        new_cols_data[rrr_col] = ret_s / total_prev_nonzero
+        new_cols_data[rrr_col] = ret_s / total_prev_nonzero -1
         rev_growth = (total - total.shift(1)) / total_prev_nonzero
         new_cols_data[revenue_growth_col] = rev_growth
-        new_cols_data[acq_rate_col] = new_s / new_s.shift(1)
+        new_cols_data[acq_rate_col] = new_s / new_s.shift(1) -1
         # growth mix: guard division by zero
         #denom = (total - total.shift(1)).replace(0, np.nan)
         #new_cols_data[gm_col] = (ret_s - ret_s.shift(1)) / denom
@@ -239,7 +211,7 @@ plt.figure(figsize=(10, max(4, 0.28 * len(to_plot))))
 plt.barh(to_plot.index, to_plot.values, color='black')  # single neutral color
 plt.xlabel('Number of Firms')
 plt.ylabel('GICS Sub-Industry')
-plt.title(f'Number of Firms per GICS Sub-Industry (top {len(to_plot)})')
+plt.title(f'Number of Firms per GICS Sub-Industry')
 plt.gca().invert_yaxis()   # largest on top
 plt.tight_layout()
 plt.show()
@@ -438,104 +410,404 @@ metric_cols = [c for c in df_yearly.columns if c.endswith('#Revenue_Growth') or 
 print(f"Added {len(metric_cols)} metric columns (RG/RRR/AR) across {len(firms)} firms.")
 
 
+### --- Transform yearly wide dataframe to panel (long) format ---
 
-import seaborn as sns
+# make sure Date is datetime
+df_yearly['Date'] = pd.to_datetime(df_yearly['Date'], errors='coerce')
+
+# metric suffixes present in your wide dataframe
+metrics_suffixes = ['#Revenue_Growth', '#RRR', '#Acq_Rate']
+
+# find all metric columns
+metric_cols = [c for c in df_yearly.columns if any(c.endswith(s) for s in metrics_suffixes)]
+
+# melt to long form: Date, col, value
+df_long = df_yearly.melt(id_vars='Date', value_vars=metric_cols, var_name='col', value_name='value')
+
+# extract firm and metric name
+df_long['firm'] = df_long['col'].apply(lambda c: c.split('#')[0] if '#' in c else c)
+df_long['metric'] = df_long['col'].apply(lambda c: c.split('#', 1)[1] if '#' in c else '')
+
+# pivot so each metric becomes its own column (index = Date, firm)
+df_panel = df_long.pivot_table(index=['Date', 'firm'], columns='metric', values='value', aggfunc='first').reset_index()
+
+# optional: rename metric columns to nicer names (remove accidental trailing spaces)
+df_panel.columns = [c if isinstance(c, str) else c[1] for c in df_panel.columns]  # keeps Date/firm, handles MultiIndex
+# convert metric columns to numeric
+for col in ['Revenue_Growth', 'RRR', 'Acq_Rate']:
+    if col in df_panel.columns:
+        df_panel[col] = pd.to_numeric(df_panel[col], errors='coerce')
+
+# ensure Date is datetime
+df_panel['Date'] = pd.to_datetime(df_panel['Date'], errors='coerce')
+
+# sort by firm, then date (ascending); reset index for a clean integer index
+df_panel = df_panel.sort_values(['firm', 'Date'], ascending=[True, True]).reset_index(drop=True)
+
+# preview
+print(df_panel.head())
+
+# --------------------------------------------------------------------
+# Map industry / sub-industry onto the panel (one row per Date x Firm)
+# --------------------------------------------------------------------
+# Build normalized lookup from df_industry (ID -> sub_industry only)
+if 'ID' in df_industry.columns:
+    ind_map_df = df_industry[['ID', 'gics_sub_industry_name']].copy()
+    ind_map_df['ID_norm'] = ind_map_df['ID'].astype(str).str.upper().str.strip()
+    sub_map = dict(zip(ind_map_df['ID_norm'], ind_map_df['gics_sub_industry_name']))
+
+    # normalize firm ids in a temporary Series and map to sub-industry (no new column)
+    firm_norm_series = df_panel['firm'].astype(str).str.upper().str.strip()
+    df_panel['sub_industry'] = firm_norm_series.map(sub_map).fillna('Unknown')
+
+    # diagnostics: how many unique firms in panel and how many rows map to Unknown
+    n_total_firms = firm_norm_series.nunique()
+    n_unknown = (df_panel['sub_industry'] == 'Unknown').sum()
+    print(f"Panel mapping: {n_total_firms} unique firms in panel; {n_unknown} rows with Unknown sub_industry")
+    
+    # --------------------------------------------------------------------
+    # Compute relative metrics (cRG, cRRR, cAR) = firm metric - sub-industry median
+    # and build a per-(Date, sub_industry) summary (25Q,50Q,75Q,mean,std) for
+    # the original metrics.
+    # --------------------------------------------------------------------
+    metrics = ['Revenue_Growth', 'RRR', 'Acq_Rate']
+    available_metrics = [m for m in metrics if m in df_panel.columns]
+    
+    if available_metrics:
+        # compute sub-industry median aligned to each row using groupby.transform
+        sub_medians = df_panel.groupby(['Date', 'sub_industry'])[available_metrics].transform('median')
+        
+        # compute centered columns per firm
+        if 'Revenue_Growth' in available_metrics:
+            df_panel['cRG'] = df_panel['Revenue_Growth'] - sub_medians['Revenue_Growth']
+        if 'RRR' in available_metrics:
+            df_panel['cRRR'] = df_panel['RRR'] - sub_medians['RRR']
+        if 'Acq_Rate' in available_metrics:
+            df_panel['cAR'] = df_panel['Acq_Rate'] - sub_medians['Acq_Rate']
+        
+        # Build summary statistics (long format) for original metric values per Date x sub_industry
+        summary_rows = []
+        for m in available_metrics:
+            agg = (
+                df_panel
+                .groupby(['Date', 'sub_industry'])[m]
+                .agg(
+                    q25=lambda x: x.quantile(0.25),
+                    q50=lambda x: x.quantile(0.50),
+                    q75=lambda x: x.quantile(0.75),
+                    mean='mean',
+                    std='std'
+                )
+                .reset_index()
+            )
+            agg['metric'] = m
+            summary_rows.append(agg)
+        
+        if summary_rows:
+            df_subindustry_stats = pd.concat(summary_rows, ignore_index=True)
+        else:
+            df_subindustry_stats = pd.DataFrame()
+        
+        # show small samples
+        print('\nSample centered columns (first 6 rows):')
+        print(df_panel[['Date', 'firm', 'sub_industry'] + [c for c in ['cRG','cRRR','cAR'] if c in df_panel.columns]].head(6))
+        print('\nSample sub-industry summary (first 6 rows):')
+        print(df_subindustry_stats.head(6))
+    else:
+        df_subindustry_stats = pd.DataFrame()
+        print('No metric columns (Revenue_Growth, RRR, Acq_Rate) found in panel; skipping centered columns and summary.')
+
+    # move sub_industry column next to firm for readability
+    cols = list(df_panel.columns)
+    # desired ordering: Date, firm, sub_industry, then others
+    ordered = ['Date', 'firm', 'sub_industry'] + [c for c in cols if c not in ['Date','firm','sub_industry']]
+    df_panel = df_panel.reindex(columns=ordered)
+else:
+    print("Warning: df_industry has no 'ID' column; cannot map industry info to panel.")
+
+# --------------------------------------------------------------------
+# Classify growth path per firm x period into one of four buckets using
+# centered metrics cAR (centered Acquisition Rate) and cRRR (centered RRR)
+# Rules (per your spec):
+#   "Acquisition Driven": cAR >= 0 and cRRR < 0
+#   "Retention Driven":    cAR < 0  and cRRR >= 0
+#   "Dual Engine":         cAR >= 0 and cRRR >= 0
+#   "Shrinking":           cAR < 0  and cRRR < 0
+# Rows with missing cAR or cRRR will be labeled 'Unknown'.
+# --------------------------------------------------------------------
+if {'cAR', 'cRRR'}.issubset(set(df_panel.columns)):
+    # use vectorized np.select; comparisons with NaN yield False so Unknown will be used
+    cond_acq = df_panel['cAR'] >= 0
+    cond_ret = df_panel['cRRR'] >= 0
+
+    conditions = [
+        (cond_acq & (~cond_ret)),   # Acquisition Driven: cAR>=0 and cRRR<0
+        ((~cond_acq) & cond_ret),   # Retention Driven: cAR<0 and cRRR>=0
+        (cond_acq & cond_ret),      # Dual Engine: both >= 0
+        ((~cond_acq) & (~cond_ret)) # Shrinking: both < 0
+    ]
+
+    choices = [
+        'Acquisition Driven',
+        'Retention Driven',
+        'Dual Engine',
+        'Shrinking'
+    ]
+
+    df_panel['growth_path'] = np.select(conditions, choices, default='Unknown')
+
+    # Quick diagnostics: counts per growth_path (top few)
+    gp_counts = df_panel['growth_path'].value_counts(dropna=False)
+    print('\nGrowth path distribution (sample):')
+    print(gp_counts.head(10))
+else:
+    print("Cannot compute 'growth_path': required centered columns 'cAR' and/or 'cRRR' not found in df_panel.")
+
+# --------------------------------------------------------------------
+# Add revenue_growth label per your spec: 'Increasing' if cRG >= 0, else 'Decreasing'
+# --------------------------------------------------------------------
+if 'cRG' in df_panel.columns:
+    # Comparison with NaN yields False, so NaNs become 'Decreasing' per your "else" rule
+    df_panel['revenue_growth'] = np.where(df_panel['cRG'] >= 0, 'Increasing', 'Decreasing')
+    rg_counts = df_panel['revenue_growth'].value_counts(dropna=False)
+    print('\nRevenue growth distribution (sample):')
+    print(rg_counts.head(10))
+else:
+    print("Cannot compute 'revenue_growth': required centered column 'cRG' not found in df_panel.")
+
+# --------------------------------------------------------------------
+# Firm-level dominant strategy: determine if a single growth_path and/or
+# revenue_growth label occurs in at least 50% of (non-Unknown) periods for
+# each firm. If so, declare it dominant; otherwise mark 'Mixed Strategy'.
+# We'll exclude 'Unknown' rows from the denominator when judging dominance.
+# Output: df_firm_strategy with one row per firm and columns:
+#   - firm, n_periods_growthpath, dominant_growth_path, share_growth_path,
+#   - n_periods_rev, dominant_revenue_growth, share_revenue_growth
+# --------------------------------------------------------------------
+def _dominant_label(series, ignore_label='Unknown', threshold=0.5):
+    # series: pd.Series of categorical labels for one firm
+    s = series.dropna()
+    if s.empty:
+        return ('Mixed Strategy', 0.0, 0)
+    # drop the ignore_label from consideration
+    s_non = s[s != ignore_label]
+    n_total = len(s_non)
+    if n_total == 0:
+        return ('Mixed Strategy', 0.0, 0)
+    vc = s_non.value_counts()
+    top_label = vc.idxmax()
+    top_share = vc.iloc[0] / n_total
+    if top_share >= threshold:
+        return (top_label, float(top_share), int(n_total))
+    else:
+        return ('Mixed Strategy', float(top_share), int(n_total))
+
+
+
+
+
+
+
+"""
+share of retained revenue time invariant?
+RRR autocorrelation
+AR autocorrelation
+
+"""
+
+
 import matplotlib.pyplot as plt
 
-"""
-make it more efficient, create function
-"""
+
+# --------------------------------------------------------------------
+# Median-only lollipop charts using df_subindustry_stats (q50 already computed)
+# Pools across dates by taking the median of per-date medians (q50) per sub-industry.
+# --------------------------------------------------------------------
+if 'df_subindustry_stats' not in globals() or df_subindustry_stats is None or df_subindustry_stats.empty:
+    print("df_subindustry_stats not available or empty — skipping median lollipop plots.")
+else:
+    metrics_to_plot = [
+        ('Revenue_Growth', 'Revenue Growth (RG)'),
+        ('Acq_Rate', 'Acquisition Rate (AR)'),
+        ('RRR', 'Retained Revenue Ratio (RRR)')
+    ]
+
+    for metric, pretty in metrics_to_plot:
+        sub_df = df_subindustry_stats[df_subindustry_stats['metric'] == metric]
+        if sub_df.empty:
+            print(f"No summary rows found for metric {metric}; skipping lollipop.")
+            continue
+
+        # pool across dates: take median of q50 per sub_industry
+        medians = sub_df.groupby('sub_industry')['q50'].median().dropna()
+        if medians.empty:
+            print(f"No median values to plot for {metric} in df_subindustry_stats.")
+            continue
+
+        medians = medians.sort_values(ascending=False)
+        y_pos = np.arange(len(medians))
+
+        plt.figure(figsize=(10, max(4, 0.25 * len(medians))))
+        plt.hlines(y=y_pos, xmin=0, xmax=medians.values, color='black', linewidth=2)
+        plt.scatter(medians.values, y_pos, color='black', s=40)
+        plt.yticks(y_pos, medians.index)
+        plt.xlabel(f"{pretty} (median of per-date medians)")
+        plt.ylabel('GICS Sub-Industry')
+        plt.title(f'{pretty} by Sub-Industry — median (dates pooled)')
+        plt.gca().invert_yaxis()
+        plt.tight_layout()
+        plt.show()
 
 
-# Define the columns of interest
-columns_of_interest = ["#RRR", "#Revenue_Growth", "#Acq_Rate", "#Share_Ret_Revenue", "#Growth_Mix"]
 
-# Ensure the Date column is in datetime format for proper sorting
-df_revenue['Date'] = pd.to_datetime(df_revenue['Date'])
+#==============================================================================
+# RQ:1 Firm-Level Dominant Strategy
+#==============================================================================
 
-# Iterate over each metric to generate boxplots and histograms
-for metric in columns_of_interest:
-    # Extract relevant columns for the current metric
-    metric_cols = [col for col in df_revenue.columns if metric in col]
 
-    # Melt the dataset for easier plotting with seaborn
-    df_metric_melted = df_revenue.melt(
-        id_vars=['Date'], 
-        value_vars=metric_cols, 
-        var_name='Firm', 
-        value_name=metric
-    )
+# Build summary per firm
+firms = df_panel['firm'].unique()
+rows = []
+for f in firms:
+    sub = df_panel[df_panel['firm'] == f]
 
-    # Remove the top 4 highest values correctly for display purposes (not statistics)
-    df_filtered = df_metric_melted.copy()
-    df_filtered = df_filtered[df_filtered[metric] < df_filtered[metric].nlargest(4).min()]  # Exclude top 4 values
-    # Remove the lowest 4 values for display purposes (not statistics)
-    df_filtered = df_filtered[df_filtered[metric] > df_filtered[metric].nsmallest(4).max()]  # Exclude lowest 4 values
+    # growth_path dominance
+    if 'growth_path' in sub.columns:
+        gp_label, gp_share, gp_n = _dominant_label(sub['growth_path'], ignore_label='Unknown', threshold=0.5)
+    else:
+        gp_label, gp_share, gp_n = ('Mixed Strategy', 0.0, 0)
 
-    # Compute additional statistics
-    q25, q50, q75 = df_metric_melted[metric].quantile([0.25, 0.50, 0.75])
+    # revenue_growth dominance
+    if 'revenue_growth' in sub.columns:
+        rg_label, rg_share, rg_n = _dominant_label(sub['revenue_growth'], ignore_label='Unknown', threshold=0.5)
+    else:
+        rg_label, rg_share, rg_n = ('Mixed Strategy', 0.0, 0)
 
-    # Ensure the x-axis (dates) remain sorted
-    df_filtered = df_filtered.sort_values(by="Date")
+    rows.append({
+        'firm': f,
+        'n_periods_growthpath': gp_n,
+        'dominant_growth_path': gp_label,
+        'share_growth_path': gp_share,
+        'n_periods_revenue_growth': rg_n,
+        'dominant_revenue_growth': rg_label,
+        'share_revenue_growth': rg_share,
+    })
 
-    # Boxplot
-    plt.figure(figsize=(12, 6))
-    sns.boxplot(x='Date', y=metric, data=df_filtered, color='skyblue')
+df_firm_strategy = pd.DataFrame(rows)
 
-    # Customize the chart
-    plt.xlabel('Date')
-    plt.ylabel(metric.replace("#", ""))  # Remove '#' for cleaner labels
-    plt.xticks(rotation=45, ha='right')
-    plt.grid(axis='y', linestyle='--', alpha=0.6)
-    plt.tight_layout()
-    plt.show()
+print('\nFirm-level dominant strategy sample (first 10 rows):')
+print(df_firm_strategy.head(10))
 
-    # Print summary statistics including quantiles
-    print(f"\nSummary statistics for {metric.replace('#', '')}:")
-    print(df_metric_melted[metric].describe().loc[['mean', 'std', 'min', 'max']])
-    print(f"25th Percentile (Q1): {q25:.2f}")
-    print(f"50th Percentile (Q2): {q50:.2f}")
-    print(f"75th Percentile (Q3): {q75:.2f}")
+# Count how many firms have each dominant_growth_path
+if 'dominant_growth_path' in df_firm_strategy.columns:
+    dom_counts = df_firm_strategy['dominant_growth_path'].value_counts(dropna=False)
+    print('\nCounts of firms by dominant_growth_path:')
+    print(dom_counts)
+else:
+    print("No 'dominant_growth_path' column in df_firm_strategy to count.")
 
-    # Histogram
-    plt.figure(figsize=(10, 6))
-    sns.histplot(df_filtered[metric], bins=30, kde=True, color='skyblue')
+# --------------------------------------------------------------------
+# Cluster-robust OLS (no fixed effects)
+# Estimate: cRG ~ cAR + cRRR and report SEs clustered by firm. This is the
+# user's requested default: pooled OLS with firm-clustered standard errors.
+# Graceful fallbacks: if statsmodels missing or clustering fails, print plain OLS.
+# --------------------------------------------------------------------
+try:
+    import statsmodels.formula.api as smf
+    import statsmodels.api as sm
+except Exception as e:
+    print(f"Statsmodels not available; skipping clustered OLS: {e}")
+else:
+    reg_cols = ['Date', 'firm', 'cRG', 'cAR', 'cRRR']
+    if not set(reg_cols).issubset(set(df_panel.columns)):
+        print("Not all regression columns present (need Date, firm, cRG, cAR, cRRR); skipping regression.")
+    else:
+        # build a compact dataframe and drop rows with any missing regression values
+        df_reg = df_panel[reg_cols].dropna().copy()
+        if df_reg.empty:
+            print("No complete observations for regression after dropping NaNs; skipping regression.")
+        else:
+            # add a Year column for diagnostics only (not used in model)
+            df_reg['Year'] = df_reg['Date'].dt.year
+            n_obs = len(df_reg)
+            n_firms = df_reg['firm'].nunique()
+            n_years = df_reg['Year'].nunique()
+            print(f"Running pooled OLS on {n_obs} obs, {n_firms} firms, {n_years} years (clustered SEs by firm)")
 
-    # Customize the plot
-    plt.xlabel(metric.replace("#", ""))
-    plt.ylabel('Frequency')
-    plt.grid(axis='y', linestyle='--', alpha=0.6)
-    plt.show()
+            formula = 'cRG ~ cAR + cRRR'
+            try:
+                mod = smf.ols(formula=formula, data=df_reg)
+                res = mod.fit()
 
-"""
-Summary statistics for RRR (Excluding Top 4):
-mean    0.799884
-std     0.312226
-min     0.001062
-max     3.889442
-Name: #RRR, dtype: float64
-25th Percentile (Q1): 0.61
-75th Percentile (Q3): 0.95
+                # try cluster-robust covariance (cluster by firm)
+                try:
+                    res_clust = res.get_robustcov_results(cov_type='cluster', groups=df_reg['firm'])
 
-Summary statistics for Revenue_Growth (Excluding Top 4):
-mean    0.080728
-std     0.410411
-min    -0.998914
-max     5.636012
-Name: #Revenue_Growth, dtype: float64
-25th Percentile (Q1): -0.08
-75th Percentile (Q3): 0.17
+                    # tidy output with clustered SEs
+                    keep_vars = list(res_clust.params.index)
+                    coef_df_clust = pd.DataFrame({
+                        'coef': res_clust.params.loc[keep_vars],
+                        'se_cluster': res_clust.bse.loc[keep_vars],
+                        't_cluster': res_clust.tvalues.loc[keep_vars],
+                        'p_cluster': res_clust.pvalues.loc[keep_vars]
+                    })
+                    ci_cl = res_clust.conf_int().loc[keep_vars]
+                    coef_df_clust['ci_lower'] = ci_cl[0]
+                    coef_df_clust['ci_upper'] = ci_cl[1]
 
-Summary statistics for Revenue_New_Growth:
-mean     0.287643
-std      0.411074
-min      0.000024
-max     16.130858
-Name: #Acq_Rate, dtype: float64
-25th Percentile (Q1): 0.10
-75th Percentile (Q3): 0.37
-"""
+                    print('\nCluster-robust OLS estimates (no fixed effects; SEs clustered by firm):')
+                    print(coef_df_clust.round(4))
+                except Exception as e_clust:
+                    print(f"Could not compute cluster-robust SEs (cluster by firm): {e_clust}\nFalling back to plain OLS summary:")
+                    print(res.summary())
+            except Exception as e_mod:
+                print(f"OLS estimation failed: {e_mod}")
 
-'''
-is the share of returning revenue time independent for a firm?
-'''
+
+
+# --------------------------------------------------------------------
+# Firm-level logistic regression (simple, compact)
+# Dependent: dominant_revenue_growth (Increasing=1). Predictor: dominant_growth_path dummies.
+# Uses statsmodels Logit and HC1 robust SEs when available. Minimal control flow.
+# --------------------------------------------------------------------
+try:
+    import statsmodels.api as sm
+except Exception as e:
+    print(f"Statsmodels not available; skipping firm-level logistic regression: {e}")
+else:
+    if 'df_firm_strategy' not in globals() or df_firm_strategy is None or df_firm_strategy.empty:
+        print('`df_firm_strategy` not present or empty; skipping firm-level logistic regression.')
+    else:
+        df_lr = df_firm_strategy[['firm', 'dominant_growth_path', 'dominant_revenue_growth']].dropna()
+        df_lr = df_lr[df_lr['dominant_revenue_growth'].isin(['Increasing', 'Decreasing'])]
+        if df_lr.empty:
+            print('No firms with clear Increasing/Decreasing outcome; skipping firm-level logistic regression.')
+        else:
+            y = (df_lr['dominant_revenue_growth'] == 'Increasing').astype(int)
+            X = pd.get_dummies(df_lr['dominant_growth_path'], prefix='growth_path', drop_first=True)
+
+            # coerce, drop any non-numeric rows, then fit
+            df_xy = pd.concat([X, y.rename('y')], axis=1).apply(pd.to_numeric, errors='coerce').dropna()
+            if df_xy.empty:
+                print('No valid rows for firm-level logistic regression after coercion; skipping.')
+            else:
+                X_clean = sm.add_constant(df_xy.drop(columns='y')).astype(float)
+                y_clean = df_xy['y'].astype(float)
+                try:
+                    # For Logit, request robust SEs directly in fit() call via cov_type parameter
+                    res = sm.Logit(y_clean, X_clean).fit(cov_type='HC1', disp=False)
+                    tidy = pd.DataFrame({
+                        'coef': res.params,
+                        'std_err': res.bse,
+                        'p_value': res.pvalues,
+                    })
+                    tidy['OR'] = np.exp(tidy['coef'])
+                    print('\nFirm-level Logit (Increasing=1) — HC1 robust SEs:')
+                    print(tidy.round(4))
+                except Exception as e:
+                    print(f'Firm-level Logit failed: {e}')
+
+
+#### if I achieve above median acquisition path -> higher likelihood of having increasing revenue growth 
+### mixed strategy is worse, shrinking of course as well 
+### how persistent is the acqusition path? 
