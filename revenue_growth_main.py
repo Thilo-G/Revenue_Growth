@@ -811,3 +811,424 @@ else:
 #### if I achieve above median acquisition path -> higher likelihood of having increasing revenue growth 
 ### mixed strategy is worse, shrinking of course as well 
 ### how persistent is the acqusition path? 
+
+
+#==============================================================================
+# RQ2: Persistency of Growth Paths (Markov Chain Analysis)
+#==============================================================================
+# Objective: Determine whether firms consistently use the same growth mechanism
+# Methodology: Treat each period's growth path as a state in a Markov chain
+# - Persistence = probability of staying in the same growth path
+# - Transition matrix = probability of moving from state i to state j
+#==============================================================================
+
+if 'growth_path' not in df_panel.columns:
+    print("\n'growth_path' column not found in df_panel; skipping Markov chain analysis.")
+else:
+    # Prepare panel data sorted by firm and date
+    df_markov = df_panel[['firm', 'Date', 'growth_path']].sort_values(['firm', 'Date']).copy()
+    df_markov = df_markov[df_markov['growth_path'] != 'Unknown'].copy()  # exclude Unknown states
+    
+    if df_markov.empty:
+        print("\nNo valid growth path observations for Markov analysis; skipping.")
+    else:
+        # Get unique states (growth paths)
+        states = sorted(df_markov['growth_path'].unique())
+        n_states = len(states)
+        print(f"\n{'='*70}")
+        print(f"RQ2: Markov Chain Analysis of Growth Path Persistence")
+        print(f"{'='*70}")
+        print(f"States: {states}")
+        print(f"Number of firms: {df_markov['firm'].nunique()}")
+        print(f"Total observations: {len(df_markov)}")
+        
+        # Create lagged growth path (previous state) within each firm
+        df_markov['growth_path_lag'] = df_markov.groupby('firm')['growth_path'].shift(1)
+        
+        # Drop first observation per firm (no previous state)
+        df_transitions = df_markov.dropna(subset=['growth_path_lag']).copy()
+        
+        if df_transitions.empty:
+            print("\nNo transitions observed (firms need at least 2 periods); skipping.")
+        else:
+            print(f"Total transitions observed: {len(df_transitions)}")
+            
+            # --------------------------------------------------------------------
+            # 1. Per-firm persistence rates
+            # --------------------------------------------------------------------
+            firm_persistence = []
+            for firm in df_transitions['firm'].unique():
+                firm_data = df_transitions[df_transitions['firm'] == firm]
+                
+                # Count transitions for this firm by state
+                for state in states:
+                    state_data = firm_data[firm_data['growth_path_lag'] == state]
+                    if len(state_data) > 0:
+                        # Persistence = fraction of times stayed in same state
+                        stayed = (state_data['growth_path'] == state).sum()
+                        total = len(state_data)
+                        persistence_rate = stayed / total
+                        firm_persistence.append({
+                            'firm': firm,
+                            'growth_path': state,
+                            'n_transitions': total,
+                            'persistence_rate': persistence_rate
+                        })
+            
+            df_persistence = pd.DataFrame(firm_persistence)
+            
+            # Summary statistics by growth path
+            if not df_persistence.empty:
+                persistence_summary = df_persistence.groupby('growth_path')['persistence_rate'].agg([
+                    ('mean', 'mean'),
+                    ('std', 'std'),
+                    ('q25', lambda x: x.quantile(0.25)),
+                    ('median', lambda x: x.quantile(0.50)),
+                    ('q75', lambda x: x.quantile(0.75)),
+                    ('n_firms', 'count')
+                ]).reset_index()
+                
+                print("\n" + "="*70)
+                print("PERSISTENCE SUMMARY BY GROWTH PATH")
+                print("="*70)
+                print("(Persistence = Probability of staying in same state next period)")
+                print("\n" + persistence_summary.to_string(index=False))
+                print("="*70)
+            
+            # --------------------------------------------------------------------
+            # 2. Global transition matrix (averaged across all firms)
+            # --------------------------------------------------------------------
+            # Count all transitions globally
+            transition_counts = pd.crosstab(
+                df_transitions['growth_path_lag'],
+                df_transitions['growth_path'],
+                margins=False
+            )
+            
+            # Ensure all states appear (fill missing with 0)
+            for state in states:
+                if state not in transition_counts.index:
+                    transition_counts.loc[state] = 0
+                if state not in transition_counts.columns:
+                    transition_counts[state] = 0
+            
+            # Reorder to match state order
+            transition_counts = transition_counts.reindex(index=states, columns=states, fill_value=0)
+            
+            # Convert counts to probabilities (row-normalize)
+            transition_probs = transition_counts.div(transition_counts.sum(axis=1), axis=0).fillna(0)
+            
+            print("\n" + "="*70)
+            print("GLOBAL TRANSITION PROBABILITY MATRIX")
+            print("="*70)
+            print("(Rows = current state, Columns = next state)")
+            print("\n" + transition_probs.round(3).to_string())
+            print("="*70)
+            
+            # --------------------------------------------------------------------
+            # 3. Heatmap of transition probabilities
+            # --------------------------------------------------------------------
+            try:
+                import matplotlib.pyplot as plt
+                import seaborn as sns
+                
+                plt.figure(figsize=(10, 8))
+                sns.heatmap(
+                    transition_probs,
+                    annot=True,
+                    fmt='.3f',
+                    cmap='YlOrRd',
+                    cbar_kws={'label': 'Transition Probability'},
+                    xticklabels=states,
+                    yticklabels=states,
+                    vmin=0,
+                    vmax=1
+                )
+                plt.title('Growth Path Transition Probabilities\n(Averaged Across All Firms)', fontsize=14, fontweight='bold')
+                plt.xlabel('Next Period State', fontsize=12)
+                plt.ylabel('Current Period State', fontsize=12)
+                plt.xticks(rotation=45, ha='right')
+                plt.yticks(rotation=0)
+                plt.tight_layout()
+                plt.show()
+                
+                print("\nHeatmap displayed. Diagonal = persistence (staying in same state).")
+                print("Off-diagonal = transition probabilities to other states.")
+                
+            except Exception as e:
+                print(f"\nCould not create heatmap: {e}")
+
+
+#==============================================================================
+# RQ3: Trend Analysis - ARIMA(0,1,0) for Growth Path Trajectories
+#==============================================================================
+# Objective: Identify trajectories of cAR, cRRR, and cRG over time
+# Methodology: ARIMA(0,1,0) = Random Walk = First Differences
+#   - Models ΔcAR, ΔcRRR, ΔcRG (change from t-1 to t)
+#   - Tests if trends differ by growth path
+#   - Examines how component trends (ΔcAR, ΔcRRR) impact revenue growth trend (ΔcRG)
+#==============================================================================
+
+if 'cRG' not in df_panel.columns or 'cAR' not in df_panel.columns or 'cRRR' not in df_panel.columns:
+    print("\nCentered metrics (cRG, cAR, cRRR) not found in df_panel; skipping RQ3 trend analysis.")
+else:
+    # --------------------------------------------------------------------
+    # 1. Create first differences (ARIMA 0,1,0)
+    # --------------------------------------------------------------------
+    print(f"\n{'='*80}")
+    print(f"RQ3: Trend Analysis Using ARIMA(0,1,0) - First Differences")
+    print(f"{'='*80}\n")
+    
+    # Start with panel data containing centered metrics
+    df_trend = df_panel[['firm', 'Date', 'cRG', 'cAR', 'cRRR', 'growth_path']].copy()
+    
+    # Compute first differences within each firm (sorted by date)
+    df_trend = df_trend.sort_values(['firm', 'Date'])
+    for var in ['cRG', 'cAR', 'cRRR']:
+        df_trend[f'delta_{var}'] = df_trend.groupby('firm')[var].diff()
+    
+    # Drop rows with missing deltas (first observation per firm)
+    df_trend_clean = df_trend.dropna(subset=['delta_cRG', 'delta_cAR', 'delta_cRRR']).copy()
+    
+    print(f"Trend analysis sample: {len(df_trend_clean)} observations, {df_trend_clean['firm'].nunique()} firms")
+    
+    # Descriptive statistics of first differences by growth path
+    if 'growth_path' in df_trend_clean.columns:
+        print("\nMean first differences by growth path:")
+        for path in ['Acquisition Driven', 'Retention Driven', 'Dual Engine', 'Shrinking']:
+            sub = df_trend_clean[df_trend_clean['growth_path'] == path]
+            if len(sub) > 0:
+                print(f"\n{path} (n={len(sub)}):")
+                print(f"  ΔcAR:  {sub['delta_cAR'].mean():.4f}")
+                print(f"  ΔcRRR: {sub['delta_cRRR'].mean():.4f}")
+                print(f"  ΔcRG:  {sub['delta_cRG'].mean():.4f}")
+    
+    # --------------------------------------------------------------------
+    # 2. Test significance of trends: Three independent regressions
+    # --------------------------------------------------------------------
+    print(f"\n{'='*80}")
+    print("TREND SIGNIFICANCE TESTS (ARIMA 0,1,0)")
+    print(f"{'='*80}\n")
+    
+    # Prepare regression data
+    df_reg_trend = df_trend_clean.dropna(subset=['delta_cRG', 'delta_cAR', 'delta_cRRR', 'firm', 'Date']).copy()
+    
+    if len(df_reg_trend) > 50:  # Minimum sample size
+        try:
+            from linearmodels.panel import PanelOLS
+            import statsmodels.api as sm
+            
+            # Set panel index
+            df_reg_trend = df_reg_trend.set_index(['firm', 'Date'])
+            
+            # Regression 1: ΔcAR ~ 1 with firm fixed effects
+            print("Regression 1: ΔcAR ~ constant + firm FE")
+            y_reg = df_reg_trend[['delta_cAR']]
+            X_reg = sm.add_constant(pd.DataFrame(index=y_reg.index))
+            model1 = PanelOLS(y_reg, X_reg, entity_effects=True, time_effects=False, drop_absorbed=True)
+            results1 = model1.fit(cov_type='clustered', cluster_entity=True, cluster_time=True)
+            print(results1.summary)
+            print("\n")
+            
+            # Regression 2: ΔcRRR ~ 1 with firm fixed effects
+            print("Regression 2: ΔcRRR ~ constant + firm FE")
+            y_reg = df_reg_trend[['delta_cRRR']]
+            X_reg = sm.add_constant(pd.DataFrame(index=y_reg.index))
+            model2 = PanelOLS(y_reg, X_reg, entity_effects=True, time_effects=False, drop_absorbed=True)
+            results2 = model2.fit(cov_type='clustered', cluster_entity=True, cluster_time=True)
+            print(results2.summary)
+            print("\n")
+            
+            # Regression 3: ΔcRG ~ 1 with firm fixed effects
+            print("Regression 3: ΔcRG ~ constant + firm FE")
+            y_reg = df_reg_trend[['delta_cRG']]
+            X_reg = sm.add_constant(pd.DataFrame(index=y_reg.index))
+            model3 = PanelOLS(y_reg, X_reg, entity_effects=True, time_effects=False, drop_absorbed=True)
+            results3 = model3.fit(cov_type='clustered', cluster_entity=True, cluster_time=True)
+            print(results3.summary)
+            print(f"\n{'='*80}\n")
+            
+            # --------------------------------------------------------------------
+            # 3. Extract firm fixed effects and create histograms
+            # --------------------------------------------------------------------
+            print(f"\n{'='*80}")
+            print("FIRM FIXED EFFECTS HISTOGRAMS")
+            print(f"{'='*80}\n")
+            
+            # Extract firm fixed effects from each model
+            # Note: PanelOLS with entity_effects=True estimates firm fixed effects
+            # The estimated_effects attribute contains these effects
+            try:
+                import matplotlib.pyplot as plt
+                from scipy import stats
+                
+                fe_data = {}
+                models = [
+                    (results1, model1, 'ΔcAR', 'delta_cAR'),
+                    (results2, model2, 'ΔcRRR', 'delta_cRRR'),
+                    (results3, model3, 'ΔcRG', 'delta_cRG')
+                ]
+                
+                def _extract_entity_effects(res_obj):
+                    effects = getattr(res_obj, 'estimated_effects', None)
+                    if effects is None:
+                        return None
+
+                    eff_df = effects.copy()
+
+                    # If columns are multi-level (e.g., ('entity', 'effect')), select entity level
+                    if isinstance(eff_df, pd.DataFrame):
+                        if isinstance(eff_df.columns, pd.MultiIndex):
+                            level0 = eff_df.columns.get_level_values(0)
+                            if 'entity' in level0:
+                                eff_df = eff_df.xs('entity', axis=1, level=0)
+                            # collapse remaining multi-index columns if only one column at lower level
+                            if isinstance(eff_df, pd.DataFrame) and eff_df.shape[1] == 1:
+                                eff_df = eff_df.iloc[:, 0]
+                        elif eff_df.shape[1] == 1:
+                            eff_df = eff_df.iloc[:, 0]
+
+                    if isinstance(eff_df, pd.DataFrame):
+                        # If still DataFrame, take first column as fixed effect values
+                        eff_series = eff_df.iloc[:, 0]
+                    else:
+                        eff_series = eff_df
+
+                    if eff_series is None:
+                        return None
+
+                    if isinstance(eff_series, pd.DataFrame):
+                        eff_series = eff_series.iloc[:, 0]
+
+                    eff_series = pd.Series(eff_series, copy=True)
+
+                    if isinstance(eff_series.index, pd.MultiIndex):
+                        names = list(eff_series.index.names)
+                        if 'firm' in names:
+                            drop_levels = [lvl for lvl in names if lvl != 'firm']
+                            eff_series = eff_series.droplevel(drop_levels)
+                        else:
+                            # fallback: keep the last level (assumed to be entity id)
+                            eff_series = eff_series.droplevel(list(range(eff_series.index.nlevels - 1)))
+
+                    eff_series.name = 'firm_effect'
+                    eff_series = eff_series.astype(float)
+
+                    if not eff_series.index.is_unique:
+                        eff_series = eff_series.groupby(level=0).mean()
+
+                    return eff_series
+
+                for results, model, label, var in models:
+                    fe = _extract_entity_effects(results)
+                    if fe is None or fe.empty:
+                        print(f"{label}: No entity fixed effects available")
+                        fe_data[label] = None
+                        continue
+
+                    # Residual variance for approximate SEs
+                    residual_var = results.resid_ss / results.df_resid
+
+                    firm_counts = (
+                        df_reg_trend.reset_index()
+                        .groupby('firm')
+                        .size()
+                    )
+
+                    counts_map = firm_counts.to_dict()
+                    n_obs = fe.index.map(counts_map)
+
+                    fe_df = pd.DataFrame({
+                        'effect': fe,
+                        'n_obs': n_obs,
+                    })
+                    fe_df = fe_df.dropna()
+                    fe_df = fe_df[fe_df['n_obs'] > 1]
+
+                    if fe_df.empty:
+                        print(f"{label}: No firms with sufficient observations for FE histogram")
+                        fe_data[label] = None
+                        continue
+
+                    fe_df['se'] = np.sqrt(residual_var / fe_df['n_obs'])
+                    fe_df['t_stat'] = fe_df['effect'] / fe_df['se']
+
+                    t_stats = fe_df['t_stat']
+                    df_resid = results.df_resid
+                    p_values = pd.Series(
+                        2 * (1 - stats.t.cdf(np.abs(t_stats), df_resid)),
+                        index=fe_df.index,
+                    )
+
+                    fe_filtered = fe_df['effect'].copy()
+                    fe_filtered.loc[p_values > 0.1] = 0
+
+                    fe_filtered.name = 'effect'
+                    fe_filtered.index.name = 'firm'
+                    fe_data[label] = fe_filtered
+
+                    n_total = len(fe_df)
+                    n_significant = (p_values <= 0.1).sum()
+                    n_zero = (fe_filtered == 0).sum()
+                    print(
+                        f"{label}: {n_total} firms, {n_significant} significant (p≤0.1), {n_zero} set to zero"
+                    )
+                
+                # Create histograms
+                fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+                
+                for idx, (label, fe_filtered) in enumerate(fe_data.items()):
+                    if fe_filtered is not None and len(fe_filtered) > 0:
+                        ax = axes[idx]
+                        
+                        # Plot histogram
+                        ax.hist(fe_filtered, bins=30, color='black', edgecolor='white', alpha=0.7)
+                        ax.axvline(x=0, color='red', linestyle='--', linewidth=1.5, label='Zero')
+                        ax.set_xlabel('Firm Fixed Effect')
+                        ax.set_ylabel('Frequency')
+                        ax.set_title(f'{label} Firm Fixed Effects\n(p>0.1 set to 0)')
+                        ax.legend()
+                        ax.grid(axis='y', alpha=0.3)
+                        
+                        # Add statistics text
+                        mean_fe = fe_filtered.mean()
+                        median_fe = fe_filtered.median()
+                        ax.text(0.02, 0.98, f'Mean: {mean_fe:.4f}\nMedian: {median_fe:.4f}',
+                               transform=ax.transAxes, verticalalignment='top',
+                               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                    else:
+                        axes[idx].text(0.5, 0.5, f'{label}\nNo data',
+                                      ha='center', va='center', transform=axes[idx].transAxes)
+                        axes[idx].set_title(f'{label} Firm Fixed Effects')
+                
+                plt.tight_layout()
+                plt.show()
+                
+                print(f"\n{'='*80}\n")
+                
+            except Exception as e:
+                print(f"Could not create firm fixed effects histograms: {e}")
+                import traceback
+                traceback.print_exc()
+            
+        except Exception as e:
+            print(f"\nTrend significance tests failed: {e}")
+    else:
+        print(f"\nInsufficient observations for regression (n={len(df_reg_trend)}); skipping.")
+    
+
+
+#==============================================================================
+# RQ4: Which growth path yields the highest long-run revenue growth?
+#==============================================================================
+
+long_run = (
+    df_panel[['firm', 'cRG', 'growth_path']]
+    .dropna(subset=['cRG', 'growth_path'])
+    .groupby(['growth_path'])['cRG']
+    .median()
+    .sort_values(ascending=False)
+)
+
+print(long_run)
+
