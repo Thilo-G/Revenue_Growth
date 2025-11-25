@@ -22,16 +22,17 @@ try:
     print("Shape:", df_revenue.shape)
 
     # Read the industry file
-    df_industry = pd.read_excel(file2_path, header=None);  # Load with no header
+    df_industry = pd.read_excel(file2_path, header=0);  # Load with header
     print("Industry-Daten erfolgreich eingelesen.")
     print("Shape:", df_industry.shape)
 
 except Exception as e:
-    print(f'Could not run firm-level logistic regression: {e}')
+    print(f'Could not run: {e}')
     raise KeyError("Expected column 'gics_sub_industry_name' in df_industry")
 
 # raw counts per sub-industry (before threshold)
 sub_counts_raw = df_industry['gics_sub_industry_name'].value_counts(dropna=True)
+
 
 # keep only sub-industries with at least 3 firms
 min_firms_per_sub = 3
@@ -387,9 +388,9 @@ for f in firms:
     if rg_col not in existing_cols:
         metrics_data[rg_col] = (tot_s - tot_prev) / tot_prev_safe
     if rrr_col not in existing_cols:
-        metrics_data[rrr_col] = ret_s / tot_prev_safe
+        metrics_data[rrr_col] = (ret_s / tot_prev_safe) - 1
     if ar_col not in existing_cols:
-        metrics_data[ar_col] = new_s / new_s.shift(1).replace(0, np.nan)
+        metrics_data[ar_col] = (new_s / new_s.shift(1).replace(0, np.nan)) - 1
 
 # concat once and defragment
 if metrics_data:
@@ -448,17 +449,141 @@ df_panel = df_panel.sort_values(['firm', 'Date'], ascending=[True, True]).reset_
 print(df_panel.head())
 
 # --------------------------------------------------------------------
+# Within-firm variance for core metrics + summary stats across firms
+# --------------------------------------------------------------------
+metrics_for_variance = [m for m in ['RRR', 'Acq_Rate', 'Revenue_Growth'] if m in df_panel.columns]
+if metrics_for_variance:
+    df_firm_variance = (
+        df_panel.groupby('firm')[metrics_for_variance]
+        .var(ddof=1)
+        .rename(columns={m: f'{m}_var' for m in metrics_for_variance})
+        .reset_index()
+    )
+
+    summary_rows = []
+    for metric in metrics_for_variance:
+        series = df_firm_variance[f'{metric}_var'].dropna()
+        if series.empty:
+            continue
+        summary_rows.append({
+            'metric': metric,
+            'mean': series.mean(),
+            'std': series.std(ddof=1),
+            '25Q': series.quantile(0.25),
+            '50Q': series.quantile(0.50),
+            '75Q': series.quantile(0.75),
+        })
+
+    if summary_rows:
+        variance_summary = pd.DataFrame(summary_rows)
+        print('\nWithin-firm variance summary (variance of metric by firm):')
+        print(variance_summary.to_string(index=False))
+
+        top_n = 5  # configurable number of firms to display per metric
+        for metric in metrics_for_variance:
+            var_col = f'{metric}_var'
+            if var_col not in df_firm_variance.columns:
+                continue
+
+            top_firms = (
+                df_firm_variance[['firm', var_col]]
+                .dropna()
+                .sort_values(var_col, ascending=False)
+                .head(top_n)
+            )
+
+            if top_firms.empty:
+                continue
+
+            print(f"\nTop {len(top_firms)} firms by within-firm variance in {metric}:")
+            print(top_firms.to_string(index=False))
+else:
+    df_firm_variance = pd.DataFrame()
+    print('No metrics available to compute within-firm variance.')
+
+
+#within industry variance over all periods
+metrics_for_industry_var = [m for m in ['RRR', 'Acq_Rate', 'Revenue_Growth'] if m in df_panel.columns]
+if metrics_for_industry_var and 'sub_industry' in df_panel.columns:
+    df_industry_variance = (
+        df_panel.groupby('sub_industry')[metrics_for_industry_var]
+        .var(ddof=1)
+        .rename(columns={m: f'{m}_var' for m in metrics_for_industry_var})
+        .reset_index()
+    )
+
+    print('\nWithin-industry variance across all periods (GICS sub-industry level):')
+    print(df_industry_variance.to_string(index=False))
+
+    industry_summary_rows = []
+    for metric in metrics_for_industry_var:
+        var_col = f'{metric}_var'
+        if var_col not in df_industry_variance.columns:
+            continue
+        series = df_industry_variance[var_col].dropna()
+        if series.empty:
+            continue
+        industry_summary_rows.append({
+            'metric': metric,
+            'mean': series.mean(),
+            'std': series.std(ddof=1),
+            '25Q': series.quantile(0.25),
+            '50Q': series.quantile(0.50),
+            '75Q': series.quantile(0.75),
+        })
+
+    if industry_summary_rows:
+        industry_variance_summary = pd.DataFrame(industry_summary_rows)
+        print('\nWithin-industry variance summary (variance of metric by sub-industry):')
+        print(industry_variance_summary.to_string(index=False))
+
+    top_n = 5
+    for metric in metrics_for_industry_var:
+        var_col = f'{metric}_var'
+        if var_col not in df_industry_variance.columns:
+            continue
+
+        top_industries = (
+            df_industry_variance[['sub_industry', var_col]]
+            .dropna()
+            .sort_values(var_col, ascending=False)
+            .head(top_n)
+        )
+
+        if top_industries.empty:
+            continue
+
+        print(f"\nTop {len(top_industries)} sub-industries by variance in {metric}:")
+        print(top_industries.to_string(index=False))
+else:
+    df_industry_variance = pd.DataFrame()
+    print('Cannot compute within-industry variance: missing metrics or sub_industry column.')
+
+# --------------------------------------------------------------------
 # Map industry / sub-industry onto the panel (one row per Date x Firm)
 # --------------------------------------------------------------------
 # Build normalized lookup from df_industry (ID -> sub_industry only)
 if 'ID' in df_industry.columns:
-    ind_map_df = df_industry[['ID', 'gics_sub_industry_name']].copy()
+    cols_present = [
+        col
+        for col in ['ID', 'gics_sub_industry_name', 'gics_industry_name']
+        if col in df_industry.columns
+    ]
+    ind_map_df = df_industry[cols_present].copy()
     ind_map_df['ID_norm'] = ind_map_df['ID'].astype(str).str.upper().str.strip()
     sub_map = dict(zip(ind_map_df['ID_norm'], ind_map_df['gics_sub_industry_name']))
+
+    industry_map = {}
+    if 'gics_industry_name' in ind_map_df.columns:
+        industry_map = dict(zip(ind_map_df['ID_norm'], ind_map_df['gics_industry_name']))
 
     # normalize firm ids in a temporary Series and map to sub-industry (no new column)
     firm_norm_series = df_panel['firm'].astype(str).str.upper().str.strip()
     df_panel['sub_industry'] = firm_norm_series.map(sub_map).fillna('Unknown')
+    if industry_map:
+        df_panel['industry'] = firm_norm_series.map(industry_map).fillna('Unknown')
+    else:
+        df_panel['industry'] = 'Unknown'
 
     # diagnostics: how many unique firms in panel and how many rows map to Unknown
     n_total_firms = firm_norm_series.nunique()
@@ -519,11 +644,76 @@ if 'ID' in df_industry.columns:
 
     # move sub_industry column next to firm for readability
     cols = list(df_panel.columns)
-    # desired ordering: Date, firm, sub_industry, then others
-    ordered = ['Date', 'firm', 'sub_industry'] + [c for c in cols if c not in ['Date','firm','sub_industry']]
+    # desired ordering: Date, firm, industry info, then others
+    ordered = ['Date', 'firm', 'industry', 'sub_industry'] + [
+        c for c in cols if c not in ['Date', 'firm', 'industry', 'sub_industry']
+    ]
     df_panel = df_panel.reindex(columns=ordered)
 else:
     print("Warning: df_industry has no 'ID' column; cannot map industry info to panel.")
+    df_panel['industry'] = 'Unknown'
+
+
+
+# --------------------------------------------------------------------
+# Sub-industry lollipop charts (median metrics per GICS sub-industry)
+# --------------------------------------------------------------------
+sub_industry_col = 'sub_industry'
+
+if sub_industry_col in df_panel.columns:
+    metric_specs = [
+        ('RRR', 'Revenue Retention Rate (RRR)'),
+        ('Acq_Rate', 'Acquisition Rate (AR)'),
+        ('Revenue_Growth', 'Revenue Growth (RG)')
+    ]
+
+    df_industry_metrics = df_panel[[sub_industry_col] + [m for m, _ in metric_specs if m in df_panel.columns]].copy()
+    df_industry_metrics[sub_industry_col] = df_industry_metrics[sub_industry_col].fillna('Unknown')
+    df_industry_metrics = df_industry_metrics[df_industry_metrics[sub_industry_col] != 'Unknown']
+
+    for metric, pretty_label in metric_specs:
+        if metric not in df_industry_metrics.columns:
+            print(f"Metric {metric} not available for industry lollipop; skipping.")
+            continue
+
+        metric_series = pd.to_numeric(df_industry_metrics[metric], errors='coerce')
+        medians = (
+            df_industry_metrics
+            .assign(metric_value=metric_series)
+            .dropna(subset=['metric_value'])
+            .groupby(sub_industry_col)['metric_value']
+            .median()
+            .sort_values(ascending=False)
+        )
+
+        if medians.empty:
+            print(f"No median values available for {pretty_label}; skipping lollipop chart.")
+            continue
+
+        y_pos = np.arange(len(medians))
+        med_vals = medians.values
+        xmin = np.minimum(0, med_vals)
+        xmax = np.maximum(0, med_vals)
+
+        plt.figure(figsize=(10, max(4, 0.3 * len(medians))))
+        plt.hlines(y=y_pos, xmin=xmin, xmax=xmax, color='black', linewidth=2)
+        plt.scatter(med_vals, y_pos, color='black', s=50)
+        plt.yticks(y_pos, medians.index)
+        plt.xlabel(f"Median {pretty_label}")
+        plt.ylabel('GICS Sub-Industry')
+        plt.title(f"Median {pretty_label} by GICS Sub-Industry")
+        plt.axvline(0, color='gray', linestyle='--', linewidth=1)
+        plt.gca().invert_yaxis()
+        plt.tight_layout()
+        plt.show()
+else:
+    print("Sub-industry column missing in df_panel; skipping sub-industry lollipop charts.")
+
+
+
+
+
+
 
 # --------------------------------------------------------------------
 # Classify growth path per firm x period into one of four buckets using
@@ -614,49 +804,6 @@ RRR autocorrelation
 AR autocorrelation
 
 """
-
-
-import matplotlib.pyplot as plt
-
-
-# --------------------------------------------------------------------
-# Median-only lollipop charts using df_subindustry_stats (q50 already computed)
-# Pools across dates by taking the median of per-date medians (q50) per sub-industry.
-# --------------------------------------------------------------------
-if 'df_subindustry_stats' not in globals() or df_subindustry_stats is None or df_subindustry_stats.empty:
-    print("df_subindustry_stats not available or empty — skipping median lollipop plots.")
-else:
-    metrics_to_plot = [
-        ('Revenue_Growth', 'Revenue Growth (RG)'),
-        ('Acq_Rate', 'Acquisition Rate (AR)'),
-        ('RRR', 'Retained Revenue Ratio (RRR)')
-    ]
-
-    for metric, pretty in metrics_to_plot:
-        sub_df = df_subindustry_stats[df_subindustry_stats['metric'] == metric]
-        if sub_df.empty:
-            print(f"No summary rows found for metric {metric}; skipping lollipop.")
-            continue
-
-        # pool across dates: take median of q50 per sub_industry
-        medians = sub_df.groupby('sub_industry')['q50'].median().dropna()
-        if medians.empty:
-            print(f"No median values to plot for {metric} in df_subindustry_stats.")
-            continue
-
-        medians = medians.sort_values(ascending=False)
-        y_pos = np.arange(len(medians))
-
-        plt.figure(figsize=(10, max(4, 0.25 * len(medians))))
-        plt.hlines(y=y_pos, xmin=0, xmax=medians.values, color='black', linewidth=2)
-        plt.scatter(medians.values, y_pos, color='black', s=40)
-        plt.yticks(y_pos, medians.index)
-        plt.xlabel(f"{pretty} (median of per-date medians)")
-        plt.ylabel('GICS Sub-Industry')
-        plt.title(f'{pretty} by Sub-Industry — median (dates pooled)')
-        plt.gca().invert_yaxis()
-        plt.tight_layout()
-        plt.show()
 
 
 
@@ -804,6 +951,16 @@ else:
                     tidy['OR'] = np.exp(tidy['coef'])
                     print('\nFirm-level Logit (Increasing=1) — HC1 robust SEs:')
                     print(tidy.round(4))
+
+                    lr_df = int(res.df_model)
+                    lr_stat = float(res.llr)
+                    lr_pvalue = float(res.llr_pvalue)
+                    n_obs = int(res.nobs)
+                    pseudo_r2 = float(res.prsquared)
+                    print(
+                        f"\nModel diagnostics: n_obs={n_obs}, LR chi2({lr_df})={lr_stat:.3f}, "
+                        f"p-value={lr_pvalue:.4g}, McFadden R^2={pseudo_r2:.4f}"
+                    )
                 except Exception as e:
                     print(f'Firm-level Logit failed: {e}')
 
