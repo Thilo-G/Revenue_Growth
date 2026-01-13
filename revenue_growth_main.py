@@ -12,6 +12,7 @@ import pandas as pd
 import openpyxl
 import numpy as np
 
+
 # Quarterly Revenue
 file1_path = "C:\\Users\\thkraft\\eCommerce-Goethe Dropbox\\Thilo Kraft\\Thilo(privat)\\Privat\\Research\\Revenue_Growth\\RG_Data\\Firms-Quarterly-RevenueGrowth-2025-11-21-Python.xlsx"
 file2_path = "C:\\Users\\thkraft\\eCommerce-Goethe Dropbox\\Thilo Kraft\\Thilo(privat)\\Privat\\Research\\Revenue_Growth\\RG_Data\\Firms-Industry-2025-11-21-Python.xlsx"
@@ -58,6 +59,17 @@ for col_idx, val in df_revenue.iloc[0].items():
 df_revenue = df_revenue.iloc[:, cols_to_keep].copy()
 
 # Counrt unique firms in revenue data after filtering
+# helper to normalize firm identifiers consistently throughout the pipeline
+def normalize_strings(values):
+    if values is None:
+        return []
+    normalized = []
+    for val in values:
+        if val is None:
+            continue
+        normalized.append(str(val).upper().strip())
+    return normalized
+
 normalized_firm_names_revenue_after = normalize_strings(
     set(df_revenue.iloc[0].dropna().astype(str).str.strip())
 )
@@ -145,9 +157,9 @@ for col in original_cols:
         #gm_col = new_col.replace('#New_Customers', '#Growth_Mix')
         #growth_indicator_col = new_col.replace('#New_Customers', '#Growth_Indicator')
 
-        # read once
-        new_s = df_revenue[new_col]
-        ret_s = df_revenue[col]
+        # read once and coerce to numeric to prevent string arithmetic issues
+        new_s = pd.to_numeric(df_revenue[new_col], errors='coerce')
+        ret_s = pd.to_numeric(df_revenue[col], errors='coerce')
 
         # total revenue
         total = new_s + ret_s
@@ -201,22 +213,42 @@ import seaborn as sns
 # 3.1 Industry Data#
 ###################
 
-# Plot top-N horizontal bar chart for readability
+# Post-filter industry coverage summary
 n_industries_after = df_industry['gics_industry_name'].nunique(dropna=True)
 print("Number of Industries:", n_industries_after)
 
-top_n = n_industries_after
-to_plot = sub_counts if len(sub_counts) <= top_n else sub_counts.iloc[:top_n]
+sub_counts = df_industry['gics_sub_industry_name'].value_counts(dropna=True)
+n_subindustries_after = df_industry['gics_sub_industry_name'].nunique(dropna=True)
+print("Number of Sub-Industries:", n_subindustries_after)
 
-plt.figure(figsize=(10, max(4, 0.28 * len(to_plot))))
-plt.barh(to_plot.index, to_plot.values, color='black')  # single neutral color
-plt.xlabel('Number of Firms')
-plt.ylabel('GICS Sub-Industry')
-plt.title(f'Number of Firms per GICS Sub-Industry')
-plt.gca().invert_yaxis()   # largest on top
-plt.tight_layout()
-plt.show()
-#plt.savefig('subindustry_counts_top{0}.png'.format(min(len(sub_counts), top_n)), dpi=200, bbox_inches='tight')
+df_subindustry_counts = (
+    sub_counts.rename_axis('Subindustry')
+    .reset_index(name='Number of firms')
+)
+
+total_firms = n_firms_industry_after
+
+if total_firms > 0:
+    df_subindustry_counts['Share of firms (%)'] = (
+        df_subindustry_counts['Number of firms'] / total_firms * 100
+    ).round(2)
+else:
+    df_subindustry_counts['Share of firms (%)'] = np.nan
+
+output_excel_path = 'subindustry_firm_counts.xlsx'
+try:
+    df_subindustry_counts.to_excel(output_excel_path, index=False)
+    print(f"Saved sub-industry coverage to {output_excel_path}")
+except Exception as excel_err:
+    print(f"Could not save Excel summary: {excel_err}")
+
+print(f"\nSub-industry coverage (post filter, total firms = {total_firms}):")
+display_df = df_subindustry_counts.copy()
+display_df['Share of firms'] = display_df['Share of firms (%)'].apply(
+    lambda x: f"{x:.0f}%" if pd.notnull(x) and float(x).is_integer() else (f"{x:.2f}%" if pd.notnull(x) else 'NA')
+)
+print(display_df[['Subindustry', 'Number of firms', 'Share of firms']].to_string(index=False))
+
 
 
 
@@ -416,8 +448,8 @@ print(f"Added {len(metric_cols)} metric columns (RG/RRR/AR) across {len(firms)} 
 # make sure Date is datetime
 df_yearly['Date'] = pd.to_datetime(df_yearly['Date'], errors='coerce')
 
-# metric suffixes present in your wide dataframe
-metrics_suffixes = ['#Revenue_Growth', '#RRR', '#Acq_Rate']
+# metric suffixes present in your wide dataframe (include level for size control)
+metrics_suffixes = ['#Revenue_Growth', '#RRR', '#Acq_Rate', '#Total_Revenue']
 
 # find all metric columns
 metric_cols = [c for c in df_yearly.columns if any(c.endswith(s) for s in metrics_suffixes)]
@@ -435,7 +467,7 @@ df_panel = df_long.pivot_table(index=['Date', 'firm'], columns='metric', values=
 # optional: rename metric columns to nicer names (remove accidental trailing spaces)
 df_panel.columns = [c if isinstance(c, str) else c[1] for c in df_panel.columns]  # keeps Date/firm, handles MultiIndex
 # convert metric columns to numeric
-for col in ['Revenue_Growth', 'RRR', 'Acq_Rate']:
+for col in ['Revenue_Growth', 'RRR', 'Acq_Rate', 'Total_Revenue']:
     if col in df_panel.columns:
         df_panel[col] = pd.to_numeric(df_panel[col], errors='coerce')
 
@@ -445,8 +477,96 @@ df_panel['Date'] = pd.to_datetime(df_panel['Date'], errors='coerce')
 # sort by firm, then date (ascending); reset index for a clean integer index
 df_panel = df_panel.sort_values(['firm', 'Date'], ascending=[True, True]).reset_index(drop=True)
 
+if not df_panel.empty:
+    df_panel['period_year'] = df_panel['Date'].dt.year.astype(float)
+else:
+    df_panel['period_year'] = pd.Series(dtype='float64')
+
 # preview
 print(df_panel.head())
+
+
+def print_top_metric_leaderboard(panel_df: pd.DataFrame, metric_col: str, pretty_label: str, value_label: str | None = None, top_n: int = 20) -> None:
+    """Print top-N firm-period observations for a metric."""
+    required_cols = {'firm', 'Date', metric_col}
+    if not required_cols.issubset(panel_df.columns):
+        missing = sorted(required_cols.difference(panel_df.columns))
+        print(f"Top {pretty_label} leaderboard skipped: missing columns {missing} in df_panel.")
+        return
+
+    leaderboard = panel_df[['firm', 'Date', metric_col]].dropna().copy()
+    if leaderboard.empty:
+        print(f"Top {pretty_label} leaderboard skipped: no complete observations after dropping NaNs.")
+        return
+
+    leaderboard = leaderboard.sort_values(metric_col, ascending=False).head(top_n).copy()
+    leaderboard.insert(0, 'Position', range(1, len(leaderboard) + 1))
+    leaderboard['Period'] = pd.to_datetime(leaderboard['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+    leaderboard['Firm'] = leaderboard['firm']
+    value_col = value_label or pretty_label
+    leaderboard[value_col] = leaderboard[metric_col]
+
+    display_cols = ['Position', 'Firm', 'Period', value_col]
+    print(f"\nTop {top_n} period-firm observations by {pretty_label}:")
+    print(leaderboard[display_cols].to_string(index=False))
+
+
+def get_top_firms_by_metric(panel_df: pd.DataFrame, metric_col: str, top_n: int = 5) -> set[str]:
+    """Return a set of firm names that appear in the top-N observations for the given metric."""
+    required_cols = {'firm', 'Date', metric_col}
+    if not required_cols.issubset(panel_df.columns):
+        return set()
+
+    leaderboard = panel_df[['firm', 'Date', metric_col]].dropna().copy()
+    if leaderboard.empty:
+        return set()
+
+    top_rows = leaderboard.sort_values(metric_col, ascending=False).head(top_n)
+    return set(top_rows['firm'].astype(str))
+
+
+# Leaderboards for key metrics
+print_top_metric_leaderboard(df_panel, 'Revenue_Growth', 'Revenue Growth')
+print_top_metric_leaderboard(df_panel, 'Acq_Rate', 'Acquisition Rate')
+print_top_metric_leaderboard(df_panel, 'RRR', 'Revenue Retention Rate (RRR)', value_label='RRR Value')
+
+
+# Remove firms that rank in the top 5 for any core metric (sequential pooling)
+pool_top_firms: set[str] = set()
+selection_log = []
+
+metric_sequence = [
+    ('Revenue_Growth', 'Revenue Growth'),
+    ('Acq_Rate', 'Acquisition Rate'),
+    ('RRR', 'Revenue Retention Rate (RRR)')
+]
+
+for metric_col, pretty in metric_sequence:
+    top_set = get_top_firms_by_metric(df_panel, metric_col, top_n=5)
+    new_firms = sorted(top_set - pool_top_firms)
+    pool_top_firms |= top_set
+    selection_log.append((pretty, list(sorted(top_set)), new_firms, len(pool_top_firms)))
+
+if pool_top_firms:
+    firms_before = df_panel['firm'].nunique()
+    rows_before = len(df_panel)
+
+    df_panel = df_panel[~df_panel['firm'].isin(pool_top_firms)].copy()
+
+    firms_after = df_panel['firm'].nunique()
+    rows_after = len(df_panel)
+
+    print("\nTop-5 firm pooling by metric (sequential):")
+    for pretty, top_list, new_firms, cum_count in selection_log:
+        print(f"  {pretty}: picked {len(top_list)} (new this step: {len(new_firms)} -> {new_firms}); cumulative unique: {cum_count}")
+
+    print(f"\nFiltered out pooled top firms ({len(pool_top_firms)} unique).")
+    print(f"Rows: {rows_before} -> {rows_after}; Firms: {firms_before} -> {firms_after}")
+else:
+    print("\nNo top-5 firms identified for removal (missing data or columns).")
+
+
+
 
 # --------------------------------------------------------------------
 # Within-firm variance for core metrics + summary stats across firms
@@ -654,66 +774,654 @@ else:
     df_panel['industry'] = 'Unknown'
 
 
-
 # --------------------------------------------------------------------
-# Sub-industry lollipop charts (median metrics per GICS sub-industry)
+# Firm-level average RRR and sub-industry shares of positive average RRR
 # --------------------------------------------------------------------
-sub_industry_col = 'sub_industry'
+if 'RRR' in df_panel.columns:
+    df_firm_rrr_avg = (
+        df_panel[['firm', 'RRR']]
+        .dropna(subset=['RRR'])
+        .groupby('firm', as_index=False)['RRR']
+        .mean()
+        .rename(columns={'RRR': 'avg_RRR'})
+    )
 
-if sub_industry_col in df_panel.columns:
-    metric_specs = [
-        ('RRR', 'Revenue Retention Rate (RRR)'),
-        ('Acq_Rate', 'Acquisition Rate (AR)'),
-        ('Revenue_Growth', 'Revenue Growth (RG)')
-    ]
+    total_firms_rrr = len(df_firm_rrr_avg)
+    positive_firms_rrr = (df_firm_rrr_avg['avg_RRR'] > 0).sum()
+    print(f"\nFirms with positive average RRR: {positive_firms_rrr} of {total_firms_rrr}")
 
-    df_industry_metrics = df_panel[[sub_industry_col] + [m for m, _ in metric_specs if m in df_panel.columns]].copy()
-    df_industry_metrics[sub_industry_col] = df_industry_metrics[sub_industry_col].fillna('Unknown')
-    df_industry_metrics = df_industry_metrics[df_industry_metrics[sub_industry_col] != 'Unknown']
-
-    for metric, pretty_label in metric_specs:
-        if metric not in df_industry_metrics.columns:
-            print(f"Metric {metric} not available for industry lollipop; skipping.")
-            continue
-
-        metric_series = pd.to_numeric(df_industry_metrics[metric], errors='coerce')
-        medians = (
-            df_industry_metrics
-            .assign(metric_value=metric_series)
-            .dropna(subset=['metric_value'])
-            .groupby(sub_industry_col)['metric_value']
-            .median()
-            .sort_values(ascending=False)
+    if 'sub_industry' in df_panel.columns:
+        firm_sub = (
+            df_panel[['firm', 'sub_industry']]
+            .dropna(subset=['firm', 'sub_industry'])
+            .groupby('firm')['sub_industry']
+            .agg(lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0])
+            .reset_index()
         )
 
-        if medians.empty:
-            print(f"No median values available for {pretty_label}; skipping lollipop chart.")
+        df_firm_rrr_avg = df_firm_rrr_avg.merge(firm_sub, on='firm', how='left')
+
+        sub_shares = (
+            df_firm_rrr_avg.groupby('sub_industry')
+            .agg(
+                n_firms=('firm', 'size'),
+                n_positive=('avg_RRR', lambda s: (s > 0).sum())
+            )
+            .reset_index()
+        )
+        sub_shares['share_positive'] = sub_shares['n_positive'] / sub_shares['n_firms']
+
+        if positive_firms_rrr > 0:
+            sub_shares['share_of_total_positive'] = sub_shares['n_positive'] / positive_firms_rrr
+        else:
+            sub_shares['share_of_total_positive'] = np.nan
+
+        sub_shares = sub_shares.sort_values('share_positive', ascending=False)
+
+        print('\nShare of firms with positive average RRR by sub-industry:')
+        print(sub_shares[['sub_industry', 'n_firms', 'n_positive', 'share_positive', 'share_of_total_positive']].to_string(index=False))
+    else:
+        print("Sub-industry column missing; cannot compute sub-industry shares of positive average RRR.")
+
+    # Industry-level shares (using industry column if available)
+    if 'industry' in df_panel.columns:
+        firm_ind = (
+            df_panel[['firm', 'industry']]
+            .dropna(subset=['firm', 'industry'])
+            .groupby('firm')['industry']
+            .agg(lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0])
+            .reset_index()
+        )
+
+        df_firm_rrr_ind = df_firm_rrr_avg.merge(firm_ind, on='firm', how='left')
+
+        ind_shares = (
+            df_firm_rrr_ind.groupby('industry')
+            .agg(
+                n_firms=('firm', 'size'),
+                n_positive=('avg_RRR', lambda s: (s > 0).sum())
+            )
+            .reset_index()
+        )
+        ind_shares['share_positive'] = ind_shares['n_positive'] / ind_shares['n_firms']
+
+        if positive_firms_rrr > 0:
+            ind_shares['share_of_total_positive'] = ind_shares['n_positive'] / positive_firms_rrr
+        else:
+            ind_shares['share_of_total_positive'] = np.nan
+
+        ind_shares = ind_shares.sort_values('share_positive', ascending=False)
+
+        print('\nShare of firms with positive average RRR by industry:')
+        print(ind_shares[['industry', 'n_firms', 'n_positive', 'share_positive', 'share_of_total_positive']].to_string(index=False))
+    else:
+        print("Industry column missing; cannot compute industry shares of positive average RRR.")
+else:
+    print('RRR column missing; cannot compute firm-level average RRR summary.')
+
+
+# --------------------------------------------------------------------
+# Randomness diagnostics: Ljung–Box (lag 1) and AR(1) vs mean AIC, per metric
+# Metrics tested: Revenue_Growth/cRG, Acq_Rate/cAR, RRR/cRRR
+# --------------------------------------------------------------------
+try:
+    from statsmodels.stats.diagnostic import acorr_ljungbox
+except Exception as e:
+    print(f"Statsmodels diagnostic import failed; skipping randomness diagnostics: {e}")
+else:
+    # Test only raw (non-centered) metrics as requested
+    metric_groups = [
+        ['Revenue_Growth'],
+        ['Acq_Rate'],
+        ['RRR']
+    ]
+
+    for candidates in metric_groups:
+        metric_for_randomness = candidates[0]
+        if metric_for_randomness not in df_panel.columns:
+            print(f"Randomness diagnostics skipped: {metric_for_randomness} not found in df_panel.")
             continue
 
-        y_pos = np.arange(len(medians))
-        med_vals = medians.values
-        xmin = np.minimum(0, med_vals)
-        xmax = np.maximum(0, med_vals)
+        tests = []
+        grouped = df_panel[['firm', metric_for_randomness]].dropna().copy().groupby('firm')
 
-        plt.figure(figsize=(10, max(4, 0.3 * len(medians))))
-        plt.hlines(y=y_pos, xmin=xmin, xmax=xmax, color='black', linewidth=2)
-        plt.scatter(med_vals, y_pos, color='black', s=50)
-        plt.yticks(y_pos, medians.index)
-        plt.xlabel(f"Median {pretty_label}")
-        plt.ylabel('GICS Sub-Industry')
-        plt.title(f"Median {pretty_label} by GICS Sub-Industry")
+        for firm, sub in grouped:
+            series = pd.to_numeric(sub[metric_for_randomness], errors='coerce').dropna()
+            if len(series) < 6:
+                continue  # need a few observations to test
+
+            # Ljung–Box at lag 1
+            try:
+                lb_res = acorr_ljungbox(series, lags=[1], return_df=True)
+                lb_p = lb_res['lb_pvalue'].iloc[0]
+            except Exception:
+                lb_p = np.nan
+
+            # AR(1) vs mean-only model AIC comparison
+            aic_mean = np.nan
+            aic_ar1 = np.nan
+            try:
+                mean_fit = sm.tsa.arima.model.ARIMA(series, order=(0, 0, 0)).fit()
+                aic_mean = mean_fit.aic
+            except Exception:
+                pass
+
+            try:
+                ar1_fit = sm.tsa.arima.model.ARIMA(series, order=(1, 0, 0)).fit()
+                aic_ar1 = ar1_fit.aic
+            except Exception:
+                pass
+
+            tests.append({
+                'firm': firm,
+                'n_obs': len(series),
+                'lb_p': lb_p,
+                'aic_mean': aic_mean,
+                'aic_ar1': aic_ar1
+            })
+
+        if tests:
+            df_tests = pd.DataFrame(tests)
+            tested_firms = len(df_tests)
+            lb_reject = (df_tests['lb_p'] < 0.05).sum()
+            ar1_better = (df_tests['aic_ar1'] < df_tests['aic_mean']).sum()
+
+            print(f"\nRandomness diagnostics on '{metric_for_randomness}' (firms with >=6 observations): {tested_firms} firms")
+            print(f"  Ljung–Box lag-1 rejects (p<0.05): {lb_reject} ({lb_reject/tested_firms:.1%})")
+            print(f"  AR(1) AIC better than mean-only: {ar1_better} ({ar1_better/tested_firms:.1%})")
+
+            top_lb = df_tests.sort_values('lb_p').head(5)
+            print('\nTop firms by lowest Ljung–Box p-values (structure indication):')
+            print(top_lb[['firm', 'n_obs', 'lb_p']].to_string(index=False))
+        else:
+            print(f"Randomness diagnostics skipped: not enough data (need >=6 observations per firm) for '{metric_for_randomness}'.")
+
+
+# --------------------------------------------------------------------
+# Generic AR(1) helper to keep code compact
+# --------------------------------------------------------------------
+try:
+    import statsmodels.api as sm
+except Exception as e:
+    sm = None
+    print(f"Statsmodels not available; skipping AR(1) tests: {e}")
+
+
+def run_ar1_metric(panel: pd.DataFrame, metric: str, pretty: str) -> None:
+    if sm is None:
+        return
+    if metric not in panel.columns:
+        print(f"{metric} column missing; cannot run {pretty} AR(1) test.")
+        return
+
+    if 'period_year' not in panel.columns:
+        print(f"period_year column missing; cannot add time trend for {pretty} AR(1) test.")
+        return
+
+    if 'Total_Revenue' not in panel.columns:
+        print(f"Total_Revenue column missing; cannot add size control for {pretty} AR(1) test.")
+        return
+
+    metric_counts = panel[['firm', metric]].dropna(subset=[metric]).groupby('firm').size()
+    n_ge2 = (metric_counts >= 2).sum()
+    n_ge3 = (metric_counts >= 3).sum()
+    print(f"{pretty} availability: firms with >=2 obs: {n_ge2}; firms with >=3: {n_ge3}")
+
+    grouped = (
+        panel[['firm', 'Date', 'period_year', metric, 'Total_Revenue']]
+        .dropna(subset=[metric, 'period_year', 'Total_Revenue'])
+        .sort_values(['firm', 'Date'])
+        .groupby('firm')
+    )
+
+    rows = []
+    for firm, sub in grouped:
+        sub = sub.copy()
+        sub['lag'] = sub[metric].shift(1)
+        sub['log_size'] = np.log1p(sub['Total_Revenue'])
+        sub = sub.dropna(subset=[metric, 'lag', 'period_year', 'log_size'])
+        if len(sub) < 2:
+            continue
+        try:
+            X = sm.add_constant(pd.DataFrame({
+                'lag': sub['lag'],
+                'trend': sub['period_year'],
+                'log_size': sub['log_size']
+            }))
+            y = sub[metric]
+            res = sm.OLS(y, X, missing='drop').fit()
+            lag_beta = res.params.get('lag', np.nan)
+            lag_pval = res.pvalues.get('lag', np.nan)
+            trend_beta = res.params.get('trend', np.nan)
+            trend_pval = res.pvalues.get('trend', np.nan)
+            size_beta = res.params.get('log_size', np.nan)
+            size_pval = res.pvalues.get('log_size', np.nan)
+            const_beta = res.params.get('const', np.nan)
+            const_pval = res.pvalues.get('const', np.nan)
+            rows.append({
+                'firm': firm,
+                'n_obs': len(sub),
+                'lag_beta': lag_beta,
+                'lag_pval': lag_pval,
+                'trend_beta': trend_beta,
+                'trend_pval': trend_pval,
+                'size_beta': size_beta,
+                'size_pval': size_pval,
+                'const_beta': const_beta,
+                'const_pval': const_pval
+            })
+        except Exception:
+            continue
+
+    if rows:
+        df_res = pd.DataFrame(rows)
+        tested = len(df_res)
+        lag_signif_10 = (df_res['lag_pval'] < 0.10).sum()
+        trend_signif_10 = (df_res['trend_pval'] < 0.10).sum()
+        size_signif_10 = (df_res['size_pval'] < 0.10).sum()
+        const_signif_10 = (df_res['const_pval'] < 0.10).sum()
+        print(f"\n{pretty} AR(1) test (firms with >=2 usable observations): {tested} firms")
+        print(f"  Firms with lag beta significant at 10%: {lag_signif_10} ({lag_signif_10/tested:.1%})")
+        print(f"  Firms with time-trend significant at 10%: {trend_signif_10} ({trend_signif_10/tested:.1%})")
+        print(f"  Firms with size (log revenue) significant at 10%: {size_signif_10} ({size_signif_10/tested:.1%})")
+        print(f"  Firms with constant significant at 10%: {const_signif_10} ({const_signif_10/tested:.1%})")
+    else:
+        print(f"{pretty} AR(1) test skipped: not enough data to estimate for any firm.")
+
+
+# Run AR(1) for the three metrics without per-firm listings
+run_ar1_metric(df_panel, 'RRR', 'RRR')
+run_ar1_metric(df_panel, 'Revenue_Growth', 'Revenue_Growth')
+run_ar1_metric(df_panel, 'Acq_Rate', 'Acq_Rate')
+
+
+# --------------------------------------------------------------------
+# PanelOLS regressions with lag, time trend, and size (log total revenue)
+# --------------------------------------------------------------------
+def run_panel_reg_metric(panel: pd.DataFrame, metric: str, pretty: str) -> None:
+    try:
+        from linearmodels.panel import PanelOLS
+    except Exception as e:
+        print(f"{pretty} panel regression skipped: linearmodels not available ({e}).")
+        return
+
+    required = {'firm', 'Date', 'period_year', 'Total_Revenue', metric}
+    if not required.issubset(panel.columns):
+        missing = required.difference(panel.columns)
+        print(f"{pretty} panel regression skipped: missing columns {sorted(missing)}")
+        return
+
+    df = panel[['firm', 'Date', 'period_year', 'Total_Revenue', metric]].dropna().copy()
+    if df.empty:
+        print(f"{pretty} panel regression skipped: no complete observations after dropping NaNs.")
+        return
+
+    df = df.sort_values(['firm', 'Date'])
+    df['lag'] = df.groupby('firm')[metric].shift(1)
+    df['trend'] = df['period_year']
+    df['log_size'] = np.log1p(df['Total_Revenue'])
+    df = df.dropna(subset=['lag', 'trend', 'log_size', metric])
+    if df.empty:
+        print(f"{pretty} panel regression skipped: no rows after requiring lag/trend/size.")
+        return
+
+    df = df.set_index(['firm', 'Date'])
+    y = df[metric]
+    X = sm.add_constant(df[['lag', 'trend', 'log_size']])
+
+    try:
+        model = PanelOLS(y, X, entity_effects=True, time_effects=False, drop_absorbed=True)
+        results = model.fit(cov_type='clustered', cluster_entity=True, cluster_time=False)
+        print(f"\n{pretty} panel regression (PanelOLS pooled with linear time trend + size; clustered by firm)")
+        print(f"  N obs: {results.nobs} | Firms: {df.index.get_level_values(0).nunique()}")
+        print(results.summary)
+    except Exception as e:
+        print(f"{pretty} panel regression failed: {e}")
+
+
+# Run panel regressions on the three metrics
+run_panel_reg_metric(df_panel, 'RRR', 'RRR')
+run_panel_reg_metric(df_panel, 'Revenue_Growth', 'Revenue_Growth')
+run_panel_reg_metric(df_panel, 'Acq_Rate', 'Acq_Rate')
+
+
+
+# --------------------------------------------------------------------
+# Histograms for core metrics (distribution across firm-periods)
+# --------------------------------------------------------------------
+metric_specs = [
+    ('RRR', 'Revenue Retention Rate (RRR)'),
+    ('Acq_Rate', 'Acquisition Rate (AR)'),
+    ('Revenue_Growth', 'Revenue Growth (RG)')
+]
+
+available_hist_metrics = [m for m, _ in metric_specs if m in df_panel.columns]
+
+if available_hist_metrics:
+    # summary table (mean, std, quartiles) for each available metric
+    summary_rows = []
+    for metric, pretty_label in metric_specs:
+        if metric not in available_hist_metrics:
+            continue
+        series = pd.to_numeric(df_panel[metric], errors='coerce').dropna()
+        if series.empty:
+            continue
+        summary_rows.append({
+            'metric': pretty_label,
+            'mean': series.mean(),
+            'std': series.std(ddof=1),
+            '25Q': series.quantile(0.25),
+            '50Q': series.quantile(0.50),
+            '75Q': series.quantile(0.75),
+            'n_obs': len(series)
+        })
+
+    if summary_rows:
+        summary_df = pd.DataFrame(summary_rows)
+        print('\nDistribution summary for core metrics:')
+        print(summary_df.to_string(index=False))
+
+    for metric, pretty_label in metric_specs:
+        if metric not in available_hist_metrics:
+            print(f"Metric {metric} not available for histogram; skipping.")
+            continue
+
+        metric_values = pd.to_numeric(df_panel[metric], errors='coerce').dropna()
+        metric_values = metric_values[(metric_values >= -2) & (metric_values <= 3)]
+        if metric_values.empty:
+            print(f"No data available for {pretty_label}; skipping histogram.")
+            continue
+
+        plt.figure(figsize=(8, 5))
+        sns.histplot(metric_values, bins=40, kde=True, color='black')
         plt.axvline(0, color='gray', linestyle='--', linewidth=1)
-        plt.gca().invert_yaxis()
+        plt.title(f"Distribution of {pretty_label}")
+        plt.xlabel(pretty_label)
+        plt.ylabel('Count')
         plt.tight_layout()
         plt.show()
 else:
-    print("Sub-industry column missing in df_panel; skipping sub-industry lollipop charts.")
+    print('No core metrics available for histogram plotting.')
+
+
+
+# --------------------------------------------------------------------
+# Sub-industry boxplots for core metrics (hide outliers)
+# --------------------------------------------------------------------
+
+if 'sub_industry' in df_panel.columns:
+    available_specs = [(m, label) for m, label in metric_specs if m in df_panel.columns]
+    if available_specs:
+        base_cols = ['sub_industry'] + [m for m, _ in available_specs]
+        df_box = df_panel[base_cols].copy()
+        df_box = df_box[df_box['sub_industry'].notna()]
+
+        def _plot_boxplots(data, subset_label):
+            for metric, pretty_label in available_specs:
+                plot_df = data[['sub_industry', metric]].dropna()
+                if plot_df.empty:
+                    print(f"No data available for {pretty_label} ({subset_label}); skipping boxplot.")
+                    continue
+
+                n_subs = plot_df['sub_industry'].nunique()
+                # dynamic height: 0.4 per subindustry, clipped to sensible bounds
+                height = min(max(0.4 * n_subs, 4), 25)
+
+                plt.figure(figsize=(10, height))
+                sns.boxplot(
+                    data=plot_df,
+                    y='sub_industry',
+                    x=metric,
+                    orient='h',
+                    showfliers=False,
+                    color='#1f77b4'
+                )
+                plt.title(f"{pretty_label} by Sub-industry ({subset_label})")
+                plt.xlabel(pretty_label)
+                plt.ylabel('Sub-industry')
+                plt.tight_layout()
+                plt.show()
+
+        print('\nBoxplots by sub-industry (all sub-industries):')
+        _plot_boxplots(df_box, 'All Sub-industries')
+
+        firm_counts = (
+            df_panel[['firm', 'sub_industry']]
+            .dropna()
+            .drop_duplicates()
+            .groupby('sub_industry')['firm']
+            .nunique()
+            .sort_values(ascending=False)
+        )
+        top5_subindustries = firm_counts.head(5).index.tolist()
+
+        if top5_subindustries:
+            df_box_top5 = df_box[df_box['sub_industry'].isin(top5_subindustries)].copy()
+            print('\nBoxplots by sub-industry (top 5 by firm count):')
+            _plot_boxplots(df_box_top5, 'Top 5 Sub-industries by Firm Count')
+        else:
+            print('Top-5 sub-industry list is empty; skipping focused boxplots.')
+    else:
+        print('Core metrics missing in df_panel; skipping sub-industry boxplots.')
+else:
+    print("Cannot create sub-industry boxplots: 'sub_industry' column missing in df_panel.")
+
+
+
+
+
+    # --------------------------------------------------------------------
+    # Firm-level time-trend regressions (metric ~ calendar year)
+    # --------------------------------------------------------------------
+    metrics_trend = [
+        ('Revenue_Growth', 'Revenue Growth (RG)'),
+        ('Acq_Rate', 'Acquisition Rate (AR)'),
+        ('RRR', 'Revenue Retention Rate (RRR)')
+    ]
+
+    if 'period_year' not in df_panel.columns:
+        print("Cannot run time-trend regressions: 'period_year' column missing.")
+    else:
+        try:
+            from scipy import stats
+        except Exception as e:
+            print(f"Scipy not available; skipping time-trend regressions: {e}")
+        else:
+            def _compute_trend_stats(metric: str, pretty_label: str) -> pd.DataFrame:
+                if metric not in df_panel.columns:
+                    print(f"{pretty_label} column missing; skipping time-trend regression.")
+                    return pd.DataFrame()
+
+                sub = df_panel[['firm', 'period_year', metric]].dropna()
+                if sub.empty:
+                    print(f"No data available for {pretty_label}; skipping time-trend regression.")
+                    return pd.DataFrame()
+
+                sub = sub.rename(columns={metric: 'y', 'period_year': 'x'})
+                sub['y'] = pd.to_numeric(sub['y'], errors='coerce')
+                sub['x'] = pd.to_numeric(sub['x'], errors='coerce')
+                sub = sub.dropna(subset=['x', 'y'])
+                if sub.empty:
+                    print(f"No numeric data for {pretty_label}; skipping time-trend regression.")
+                    return pd.DataFrame()
+
+                sub['x2'] = sub['x'] ** 2
+                sub['y2'] = sub['y'] ** 2
+                sub['xy'] = sub['x'] * sub['y']
+
+                agg = (
+                    sub.groupby('firm')
+                    .agg(
+                        n=('x', 'size'),
+                        sum_x=('x', 'sum'),
+                        sum_y=('y', 'sum'),
+                        sum_x2=('x2', 'sum'),
+                        sum_y2=('y2', 'sum'),
+                        sum_xy=('xy', 'sum')
+                    )
+                    .reset_index()
+                )
+
+                agg['Sxx'] = agg['sum_x2'] - (agg['sum_x'] ** 2) / agg['n']
+                agg['Sxy'] = agg['sum_xy'] - (agg['sum_x'] * agg['sum_y']) / agg['n']
+                agg['Syy'] = agg['sum_y2'] - (agg['sum_y'] ** 2) / agg['n']
+
+                agg = agg[(agg['n'] >= 3) & (agg['Sxx'] > 0)]
+                if agg.empty:
+                    print(f"Not enough observations per firm for {pretty_label}; skipping time-trend regression.")
+                    return pd.DataFrame()
+
+                agg['beta'] = agg['Sxy'] / agg['Sxx']
+                agg['SSE'] = (agg['Syy'] - agg['beta'] * agg['Sxy']).clip(lower=0)
+                agg['df'] = agg['n'] - 2
+                agg = agg[agg['df'] > 0]
+                if agg.empty:
+                    print(f"Insufficient degrees of freedom for {pretty_label}; skipping time-trend regression.")
+                    return pd.DataFrame()
+
+                agg['sigma2'] = agg['SSE'] / agg['df']
+                agg['se_beta'] = np.sqrt((agg['sigma2'] / agg['Sxx']).replace({np.inf: np.nan, -np.inf: np.nan}))
+                agg = agg[agg['se_beta'].notna() & (agg['se_beta'] > 0)]
+                if agg.empty:
+                    print(f"Could not compute standard errors for {pretty_label}; skipping time-trend regression.")
+                    return pd.DataFrame()
+
+                agg['t_stat'] = agg['beta'] / agg['se_beta']
+                agg['p_value'] = 2 * stats.t.sf(np.abs(agg['t_stat']), agg['df'])
+
+                return agg[['firm', 'n', 'beta', 'se_beta', 't_stat', 'p_value']]
+
+            for metric, pretty_label in metrics_trend:
+                trend_stats = _compute_trend_stats(metric, pretty_label)
+                if trend_stats is None or trend_stats.empty:
+                    continue
+
+                sig_betas = trend_stats[trend_stats['p_value'] < 0.1]
+                total_firms = len(trend_stats)
+                sig_count = len(sig_betas)
+                print(
+                    f"Time-trend regression ({pretty_label}): {sig_count} of {total_firms} firms with significant slope (p<0.1)"
+                )
+
+                if sig_betas.empty:
+                    print(f"No significant time trends detected for {pretty_label}.")
+                    continue
+
+                plt.figure(figsize=(8, 4))
+                plt.hist(sig_betas['beta'], bins=30, color='#1f77b4', edgecolor='white')
+                plt.axvline(0, color='black', linestyle='--', linewidth=1)
+                plt.title(f"Significant time-trend slopes for {pretty_label}")
+                plt.xlabel('Slope (beta)')
+                plt.ylabel('Number of firms')
+                plt.tight_layout()
+                plt.show()
+
+
+
+# --------------------------------------------------------------------
+# AR vs. RRR correlation decomposition and sub-industry-aware models
+# --------------------------------------------------------------------
+
+if {'Acq_Rate', 'RRR', 'sub_industry'}.issubset(df_panel.columns):
+    corr_df = df_panel[['sub_industry', 'Acq_Rate', 'RRR']].copy()
+    corr_df[['Acq_Rate', 'RRR']] = corr_df[['Acq_Rate', 'RRR']].apply(pd.to_numeric, errors='coerce')
+    corr_df = corr_df.dropna()
+
+    if corr_df.empty:
+        print('AR/RRR correlation analysis skipped: no overlapping observations after dropping NaNs.')
+    else:
+        overall_corr = corr_df['Acq_Rate'].corr(corr_df['RRR'])
+        print(f"\nOverall AR–RRR correlation (pooled): {overall_corr:.3f}")
+
+        sub_corr = (
+            corr_df.groupby('sub_industry')
+            .apply(lambda g: g['Acq_Rate'].corr(g['RRR']) if len(g) >= 3 else np.nan)
+            .dropna()
+        )
+
+        if not sub_corr.empty:
+            print('Per-sub-industry correlation (n>=3 periods) summary:')
+            print(sub_corr.describe(percentiles=[0.25, 0.5, 0.75]).to_string())
+        else:
+            print('Not enough observations per sub-industry to compute within-industry correlations.')
+
+        # Decompose into within- and between-sub-industry correlations
+        group_means = corr_df.groupby('sub_industry')[['Acq_Rate', 'RRR']].transform('mean')
+        corr_df['Acq_Rate_within'] = corr_df['Acq_Rate'] - group_means['Acq_Rate']
+        corr_df['RRR_within'] = corr_df['RRR'] - group_means['RRR']
+        within_corr = corr_df['Acq_Rate_within'].corr(corr_df['RRR_within'])
+
+        sub_means = corr_df.groupby('sub_industry')[['Acq_Rate', 'RRR']].mean().dropna()
+        between_corr = sub_means['Acq_Rate'].corr(sub_means['RRR']) if len(sub_means) > 1 else np.nan
+
+        print(
+            f"Within-sub-industry correlation (demeaned): {within_corr:.3f} | "
+            f"Between-sub-industry correlation (centroids): {between_corr:.3f}"
+        )
+
+        # Regression-based models removed per latest request; relying on correlation summaries above.
+else:
+    print("Cannot assess AR/RRR correlation by industry: required columns missing.")
+
+
+# --------------------------------------------------------------------
+# Pooled OLS: Revenue_Growth ~ Acq_Rate + RRR (clustered SEs by firm)
+# --------------------------------------------------------------------
+try:
+    import statsmodels.formula.api as smf
+    import statsmodels.api as sm
+except Exception as e:
+    print(f"Statsmodels not available; skipping pooled Revenue_Growth regression: {e}")
+else:
+    reg_cols = ['Date', 'firm', 'Revenue_Growth', 'Acq_Rate', 'RRR']
+    if not set(reg_cols).issubset(set(df_panel.columns)):
+        print("Not all regression columns present (need Date, firm, Revenue_Growth, Acq_Rate, RRR); skipping regression.")
+    else:
+        df_reg_rg = df_panel[reg_cols].dropna().copy()
+        if df_reg_rg.empty:
+            print("Revenue_Growth regression skipped: no complete observations after dropping NaNs.")
+        else:
+            df_reg_rg['Year'] = df_reg_rg['Date'].dt.year
+            n_obs_rg = len(df_reg_rg)
+            n_firms_rg = df_reg_rg['firm'].nunique()
+            n_years_rg = df_reg_rg['Year'].nunique()
+            print(f"\nRunning pooled OLS for Revenue_Growth on {n_obs_rg} obs, {n_firms_rg} firms, {n_years_rg} years (clustered SEs by firm)")
+
+            formula_rg = 'Revenue_Growth ~ Acq_Rate + RRR'
+            try:
+                mod_rg = smf.ols(formula=formula_rg, data=df_reg_rg)
+                res_rg = mod_rg.fit()
+
+                try:
+                    res_rg_clust = res_rg.get_robustcov_results(cov_type='cluster', groups=df_reg_rg['firm'])
+                    keep_vars_rg = list(res_rg_clust.params.index)
+                    coef_df_rg = pd.DataFrame({
+                        'coef': res_rg_clust.params.loc[keep_vars_rg],
+                        'se_cluster': res_rg_clust.bse.loc[keep_vars_rg],
+                        't_cluster': res_rg_clust.tvalues.loc[keep_vars_rg],
+                        'p_cluster': res_rg_clust.pvalues.loc[keep_vars_rg]
+                    })
+                    ci_rg = res_rg_clust.conf_int().loc[keep_vars_rg]
+                    coef_df_rg['ci_lower'] = ci_rg[0]
+                    coef_df_rg['ci_upper'] = ci_rg[1]
+
+                    print('\nCluster-robust OLS (Revenue_Growth ~ Acq_Rate + RRR):')
+                    print(coef_df_rg.round(4))
+                except Exception as e_clust_rg:
+                    print(f"Could not compute clustered SEs (firm level) for Revenue_Growth regression: {e_clust_rg}\nFalling back to plain OLS summary:")
+                    print(res_rg.summary())
+            except Exception as e_mod_rg:
+                print(f"Revenue_Growth regression estimation failed: {e_mod_rg}")
 
 
 
 
 
 
+
+#==============================================================================
+# RQ:2 Firm-Level Strategy
+#==============================================================================
 
 # --------------------------------------------------------------------
 # Classify growth path per firm x period into one of four buckets using
@@ -765,36 +1473,6 @@ if 'cRG' in df_panel.columns:
 else:
     print("Cannot compute 'revenue_growth': required centered column 'cRG' not found in df_panel.")
 
-# --------------------------------------------------------------------
-# Firm-level dominant strategy: determine if a single growth_path and/or
-# revenue_growth label occurs in at least 50% of (non-Unknown) periods for
-# each firm. If so, declare it dominant; otherwise mark 'Mixed Strategy'.
-# We'll exclude 'Unknown' rows from the denominator when judging dominance.
-# Output: df_firm_strategy with one row per firm and columns:
-#   - firm, n_periods_growthpath, dominant_growth_path, share_growth_path,
-#   - n_periods_rev, dominant_revenue_growth, share_revenue_growth
-# --------------------------------------------------------------------
-def _dominant_label(series, ignore_label='Unknown', threshold=0.5):
-    # series: pd.Series of categorical labels for one firm
-    s = series.dropna()
-    if s.empty:
-        return ('Mixed Strategy', 0.0, 0)
-    # drop the ignore_label from consideration
-    s_non = s[s != ignore_label]
-    n_total = len(s_non)
-    if n_total == 0:
-        return ('Mixed Strategy', 0.0, 0)
-    vc = s_non.value_counts()
-    top_label = vc.idxmax()
-    top_share = vc.iloc[0] / n_total
-    if top_share >= threshold:
-        return (top_label, float(top_share), int(n_total))
-    else:
-        return ('Mixed Strategy', float(top_share), int(n_total))
-
-
-
-
 
 
 
@@ -807,51 +1485,8 @@ AR autocorrelation
 
 
 
-#==============================================================================
-# RQ:1 Firm-Level Dominant Strategy
-#==============================================================================
 
 
-# Build summary per firm
-firms = df_panel['firm'].unique()
-rows = []
-for f in firms:
-    sub = df_panel[df_panel['firm'] == f]
-
-    # growth_path dominance
-    if 'growth_path' in sub.columns:
-        gp_label, gp_share, gp_n = _dominant_label(sub['growth_path'], ignore_label='Unknown', threshold=0.5)
-    else:
-        gp_label, gp_share, gp_n = ('Mixed Strategy', 0.0, 0)
-
-    # revenue_growth dominance
-    if 'revenue_growth' in sub.columns:
-        rg_label, rg_share, rg_n = _dominant_label(sub['revenue_growth'], ignore_label='Unknown', threshold=0.5)
-    else:
-        rg_label, rg_share, rg_n = ('Mixed Strategy', 0.0, 0)
-
-    rows.append({
-        'firm': f,
-        'n_periods_growthpath': gp_n,
-        'dominant_growth_path': gp_label,
-        'share_growth_path': gp_share,
-        'n_periods_revenue_growth': rg_n,
-        'dominant_revenue_growth': rg_label,
-        'share_revenue_growth': rg_share,
-    })
-
-df_firm_strategy = pd.DataFrame(rows)
-
-print('\nFirm-level dominant strategy sample (first 10 rows):')
-print(df_firm_strategy.head(10))
-
-# Count how many firms have each dominant_growth_path
-if 'dominant_growth_path' in df_firm_strategy.columns:
-    dom_counts = df_firm_strategy['dominant_growth_path'].value_counts(dropna=False)
-    print('\nCounts of firms by dominant_growth_path:')
-    print(dom_counts)
-else:
-    print("No 'dominant_growth_path' column in df_firm_strategy to count.")
 
 # --------------------------------------------------------------------
 # Cluster-robust OLS (no fixed effects)
@@ -913,61 +1548,69 @@ else:
 
 
 # --------------------------------------------------------------------
-# Firm-level logistic regression (simple, compact)
-# Dependent: dominant_revenue_growth (Increasing=1). Predictor: dominant_growth_path dummies.
-# Uses statsmodels Logit and HC1 robust SEs when available. Minimal control flow.
+# Firm-level share regression:
+# share_positive_revenue_growth ~ growth-path shares (baseline = Shrinking share)
 # --------------------------------------------------------------------
-try:
-    import statsmodels.api as sm
-except Exception as e:
-    print(f"Statsmodels not available; skipping firm-level logistic regression: {e}")
+required_cols = {'firm', 'growth_path', 'revenue_growth'}
+if not required_cols.issubset(df_panel.columns):
+    print('Cannot run share regression: missing firm/growth_path/revenue_growth columns in df_panel.')
 else:
-    if 'df_firm_strategy' not in globals() or df_firm_strategy is None or df_firm_strategy.empty:
-        print('`df_firm_strategy` not present or empty; skipping firm-level logistic regression.')
+    gp_df = df_panel[['firm', 'growth_path', 'revenue_growth']].dropna()
+    if gp_df.empty:
+        print('Share regression skipped: no overlapping rows after dropping NaNs.')
     else:
-        df_lr = df_firm_strategy[['firm', 'dominant_growth_path', 'dominant_revenue_growth']].dropna()
-        df_lr = df_lr[df_lr['dominant_revenue_growth'].isin(['Increasing', 'Decreasing'])]
-        if df_lr.empty:
-            print('No firms with clear Increasing/Decreasing outcome; skipping firm-level logistic regression.')
+        growth_states = ['Acquisition Driven', 'Retention Driven', 'Dual Engine', 'Shrinking']
+        share_rows = []
+        for firm, sub in gp_df.groupby('firm'):
+            total = len(sub)
+            if total == 0:
+                continue
+            share_positive = (sub['revenue_growth'] == 'Increasing').mean()
+            path_shares = (sub['growth_path'].value_counts(normalize=True)
+                           .reindex(growth_states, fill_value=0.0))
+            share_rows.append({
+                'firm': firm,
+                'share_positive': share_positive,
+                'share_acq': path_shares['Acquisition Driven'],
+                'share_ret': path_shares['Retention Driven'],
+                'share_dual': path_shares['Dual Engine'],
+                'share_shrink': path_shares['Shrinking'],
+                'n_periods': total
+            })
+
+        df_shares = pd.DataFrame(share_rows).dropna()
+        df_shares = df_shares[df_shares['n_periods'] >= 3]
+
+        if df_shares.empty:
+            print('Share regression skipped: no firms with at least 3 periods of data.')
         else:
-            y = (df_lr['dominant_revenue_growth'] == 'Increasing').astype(int)
-            X = pd.get_dummies(df_lr['dominant_growth_path'], prefix='growth_path', drop_first=True)
-
-            # coerce, drop any non-numeric rows, then fit
-            df_xy = pd.concat([X, y.rename('y')], axis=1).apply(pd.to_numeric, errors='coerce').dropna()
-            if df_xy.empty:
-                print('No valid rows for firm-level logistic regression after coercion; skipping.')
+            try:
+                import statsmodels.formula.api as smf
+            except Exception as e:
+                print(f"Statsmodels formula API unavailable; skipping share regression: {e}")
             else:
-                X_clean = sm.add_constant(df_xy.drop(columns='y')).astype(float)
-                y_clean = df_xy['y'].astype(float)
                 try:
-                    # For Logit, request robust SEs directly in fit() call via cov_type parameter
-                    res = sm.Logit(y_clean, X_clean).fit(cov_type='HC1', disp=False)
-                    tidy = pd.DataFrame({
-                        'coef': res.params,
-                        'std_err': res.bse,
-                        'p_value': res.pvalues,
-                    })
-                    tidy['OR'] = np.exp(tidy['coef'])
-                    print('\nFirm-level Logit (Increasing=1) — HC1 robust SEs:')
-                    print(tidy.round(4))
+                    formula = 'share_positive ~ share_acq + share_ret + share_dual'
+                    share_mod = smf.ols(formula=formula, data=df_shares).fit()
+                    print('\nShare regression (Shrinking share = baseline):')
+                    print(share_mod.summary().tables[1])
 
-                    lr_df = int(res.df_model)
-                    lr_stat = float(res.llr)
-                    lr_pvalue = float(res.llr_pvalue)
-                    n_obs = int(res.nobs)
-                    pseudo_r2 = float(res.prsquared)
-                    print(
-                        f"\nModel diagnostics: n_obs={n_obs}, LR chi2({lr_df})={lr_stat:.3f}, "
-                        f"p-value={lr_pvalue:.4g}, McFadden R^2={pseudo_r2:.4f}"
-                    )
+                    diag_stats = {
+                        'n_obs': int(share_mod.nobs),
+                        'r_squared': share_mod.rsquared,
+                        'adj_r_squared': share_mod.rsquared_adj,
+                        'f_stat': share_mod.fvalue,
+                        'f_pvalue': share_mod.f_pvalue,
+                        'rmse': np.sqrt(share_mod.scale) if hasattr(share_mod, 'scale') else np.nan
+                    }
+                    print('\nShare regression diagnostics:')
+                    for key, value in diag_stats.items():
+                        print(f"  {key}: {value:.4f}" if isinstance(value, (int, float)) and not pd.isna(value)
+                              else f"  {key}: {value}")
                 except Exception as e:
-                    print(f'Firm-level Logit failed: {e}')
+                    print(f'Share regression failed: {e}')
 
-
-#### if I achieve above median acquisition path -> higher likelihood of having increasing revenue growth 
-### mixed strategy is worse, shrinking of course as well 
-### how persistent is the acqusition path? 
+    
 
 
 #==============================================================================
@@ -1094,6 +1737,7 @@ else:
                     transition_probs,
                     annot=True,
                     fmt='.3f',
+                    annot_kws={'size': 10, 'weight': 'bold'},
                     cmap='YlOrRd',
                     cbar_kws={'label': 'Transition Probability'},
                     xticklabels=states,
